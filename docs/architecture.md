@@ -90,7 +90,7 @@ tools/            build-qm.sh, apply-translations.py
 | Provider / services | `/usr/share/accounts/providers/proton.provider`, `/usr/share/accounts/services/proton-carddav.service`, `proton-caldav.service` |
 | Buteo profiles | `/etc/buteo/profiles/client/proton.xml`, `/etc/buteo/profiles/sync/proton-carddav.xml`, `proton-caldav.xml` |
 | Translations | `/usr/share/proton/translations/proton_<lang>.qm` |
-| Debug log | `/tmp/proton-sync-debug.log` |
+| Debug log | `~/Documents/ProtonSync/YYYY-MM-DD.log` (local date) |
 | Token/derived cache | `QSettings("proton", "sync-tokens")` (see below) |
 
 ## Settings extension
@@ -130,8 +130,11 @@ signond blob`.
   needed.
 - Full contact JSON rows are verbose-only; counts, ID-only traces and
   errors always log.
-- Log rotation: 1 MiB cap → 256 KiB tail + marker, via FFI
-  `proton_bridge_rotate_log`, called at both plugin `init()`s.
+- Persistent daily logs: sync plugins and the Settings purge helper append
+  timestamped entries to `~/Documents/ProtonSync/YYYY-MM-DD.log`. The directory
+  is created automatically, and the local date is checked on every write so
+  a sync crossing midnight switches files. Logs survive reboot; daily files
+  are retained without truncation or automatic deletion.
 
 ## References
 

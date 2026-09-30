@@ -227,7 +227,7 @@ impl CalendarClient {
         timezone: &str,
     ) -> Result<(Vec<CalendarEvent>, bool)> {
         let v = self.fetch_events_page_raw(cal_id, query_type, start, end, page, timezone)?;
-        Ok(Self::parse_events_envelope(&v, page))
+        Self::parse_complete_events_envelope(&v, page)
     }
 
     /// Tolerant envelope parsing shared by typed and untyped listings.
@@ -264,6 +264,25 @@ impl CalendarClient {
                 .is_some_and(|total| u64::from(page) * u64::from(CALENDAR_PAGE_SIZE) < total),
         };
         (events, more)
+    }
+
+    // Keep tolerant parsing available for diagnostics, but never let a
+    // skipped row masquerade as server deletion in a replacement snapshot.
+    fn parse_complete_events_envelope(
+        v: &serde_json::Value,
+        page: u32,
+    ) -> Result<(Vec<CalendarEvent>, bool)> {
+        let (events, more) = Self::parse_events_envelope(v, page);
+        if let Some(rows) = v.get("Events").and_then(|e| e.as_array()) {
+            if rows.len() != events.len() {
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Calendar page contains undecodable events; snapshot incomplete"
+                        .into(),
+                });
+            }
+        }
+        Ok((events, more))
     }
 
     /// Raw GET for diagnostics: returns (status, body) without status checks.
@@ -507,7 +526,7 @@ impl CalendarClient {
                 )));
             }
             let v: serde_json::Value = serde_json::from_str(&body)?;
-            let (evs, more) = Self::parse_events_envelope(&v, page);
+            let (evs, more) = Self::parse_complete_events_envelope(&v, page)?;
             let n = evs.len();
             out.extend(evs);
             if std::env::var("LIVE_TRACE").is_ok() {
@@ -549,7 +568,7 @@ impl CalendarClient {
                 )));
             }
             let v: serde_json::Value = serde_json::from_str(&body)?;
-            let (evs, more) = Self::parse_events_envelope(&v, page);
+            let (evs, more) = Self::parse_complete_events_envelope(&v, page)?;
             let raw = evs.len();
             let mut kept = 0usize;
             for ev in evs {
@@ -1608,6 +1627,10 @@ mod tests {
         assert_eq!(evs[0].StartTimezone, "");
         assert_eq!(evs[0].SharedKeyPacket, "");
         assert_eq!(evs[0].SharedEvents.len(), 1);
+        assert!(
+            CalendarClient::parse_complete_events_envelope(&v, 0).is_err(),
+            "replacement snapshots must reject skipped rows"
+        );
     }
 
     #[test]

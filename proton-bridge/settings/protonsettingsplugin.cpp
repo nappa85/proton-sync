@@ -4,6 +4,7 @@
 // but runs on demand from the Settings pulley menu instead of during sync.
 
 #include "protonsettingsplugin.h"
+#include "proton_log.h"
 
 #include <QContactManager>
 #include <QContactCollection>
@@ -23,15 +24,7 @@
 
 static void purger_log(const QString &msg)
 {
-    QFile f("/tmp/proton-sync-debug.log");
-    if (f.open(QIODevice::Append | QIODevice::Text)) {
-        f.write(QDateTime::currentDateTime().toString(Qt::ISODate).toUtf8());
-        f.write(" [settings-purge] ");
-        f.write(msg.toUtf8());
-        f.write("\n");
-        f.close();
-    }
-    qDebug() << msg;
+    proton_log(QStringLiteral("[settings-purge] ") + msg);
 }
 
 ProtonDataPurger::ProtonDataPurger(QObject *parent)

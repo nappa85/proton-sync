@@ -1787,6 +1787,10 @@ mod tests {
         }]);
         c.contact_known_uids = Some(["u1".to_string()].into_iter().collect());
 
+        let _detail = server
+            .mock("GET", "/contacts/v4/c1")
+            .with_body(r#"{"Contact":{"ID":"c1","Name":"Keep","UID":"u1","ModifyTime":100}}"#)
+            .create();
         let mut engine = SyncEngine::new(c.clone());
         engine.start_sync(c);
         assert_eq!(engine.status().state, "complete");
@@ -1840,6 +1844,10 @@ mod tests {
             pending_uid: None,
         }]);
 
+        let _detail = server
+            .mock("GET", "/contacts/v4/c1")
+            .with_body(r#"{"Contact":{"ID":"c1","Name":"Keep","UID":"u1","ModifyTime":100}}"#)
+            .create();
         let mut engine = SyncEngine::new(c.clone());
         engine.start_sync(c);
         assert_eq!(engine.status().state, "complete");
@@ -1886,6 +1894,10 @@ mod tests {
         c.contact_known_uids = Some(["u1".to_string()].into_iter().collect());
         c.contact_inventory = None;
 
+        let _detail = server
+            .mock("GET", "/contacts/v4/c1")
+            .with_body(r#"{"Contact":{"ID":"c1","Name":"Keep","UID":"u1","ModifyTime":100}}"#)
+            .create();
         let mut engine = SyncEngine::new(c.clone());
         engine.start_sync(c);
         assert_eq!(engine.status().state, "complete");

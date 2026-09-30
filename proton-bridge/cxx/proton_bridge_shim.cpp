@@ -1,4 +1,5 @@
 #include "proton_bridge_shim.h"
+#include "proton_log.h"
 #include <QBuffer>
 #include <QDebug>
 #include <QThread>
@@ -10,18 +11,6 @@
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QUrl>
-
-static void proton_log(const QString &msg) {
-    QFile f("/tmp/proton-sync-debug.log");
-    if (f.open(QIODevice::Append | QIODevice::Text)) {
-        f.write(QDateTime::currentDateTime().toString(Qt::ISODate).toUtf8());
-        f.write(" ");
-        f.write(msg.toUtf8());
-        f.write("\n");
-        f.close();
-    }
-    qDebug() << msg;
-}
 
 // Verbose gate (2026-09-09): routine content-heavy lines only log when
 // PROTON_VERBOSE is set (non-empty, not "0") — same rule as Rust
@@ -140,8 +129,6 @@ ProtonContactsPlugin::~ProtonContactsPlugin()
 
 bool ProtonContactsPlugin::init()
 {
-    // Cap the world-readable debug log (1 MiB → keep 256 KiB tail).
-    proton_bridge_rotate_log("/tmp/proton-sync-debug.log");
     proton_log(QStringLiteral("ProtonContactsPlugin::init() profileName=") + getProfileName());
 
     m_accountId = iProfile.key(QStringLiteral("accountid"));
@@ -1277,8 +1264,6 @@ ProtonCalendarPlugin::~ProtonCalendarPlugin() {
     }
 }
 bool ProtonCalendarPlugin::init() {
-    // Cap the world-readable debug log (1 MiB → keep 256 KiB tail).
-    proton_bridge_rotate_log("/tmp/proton-sync-debug.log");
     proton_log(QStringLiteral("ProtonCalendarPlugin::init() profile=") + getProfileName());
     // Storage backend is mKCal + KCalendarCore (the documented Sailfish stack;
     // QtOrganizer is not shipped on this image). Probe open here so failures
@@ -2059,6 +2044,20 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         return false;
     }
     QJsonArray arr = doc.array();
+    // Validate identities before touching notebooks. Duplicate/empty UIDs
+    // cannot be inserted reliably and must not turn replacement into deletion.
+    QSet<QString> incomingUids;
+    for (const QJsonValue &value : arr) {
+        QJsonObject row = value.toObject();
+        QString uid = row.value(QLatin1String("uid")).toString();
+        qint64 rid = row.value(QLatin1String("recurrence_id")).toVariant().toLongLong();
+        QString storedUid = rid > 0 ? QStringLiteral("%1#%2").arg(uid, QString::number(rid)) : uid;
+        if (uid.isEmpty() || incomingUids.contains(storedUid)) {
+            proton_log(QStringLiteral("Invalid or duplicate calendar event UID; import aborted"));
+            return false;
+        }
+        incomingUids.insert(storedUid);
+    }
     // Group rows by Proton calendar (one notebook each, T20 separation).
     QMap<QString, QString> calNames;
     QMap<QString, QList<int>> byCal;
@@ -2073,29 +2072,28 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
     }
     // Migration + full replacement: drop events from ALL our notebooks,
     // including the legacy single per-account notebook of the first version.
-    // Dropped UIDs are tracked: sync artifacts whose tombstones must be
-    // purged even though the planner never saw them (unioned with the
-    // engine purgeable set at purge time).
+    // Dropped UIDs also identify stale artifacts from older sync versions
+    // for selective cleanup. New replacement deletions are purged on save.
     QSet<QString> removedUids;
     QString legacyUid = QStringLiteral("proton-calendar-%1").arg(m_accountId);
     QString prefix = QStringLiteral("proton-calendar-%1-").arg(m_accountId);
     mKCal::Notebook::List nbs = storage->notebooks();
+    mKCal::Notebook::Ptr legacyNotebook;
     for (const mKCal::Notebook::Ptr &nb : nbs) {
         if (!nb) continue;
         if (nb->uid() != legacyUid && !nb->uid().startsWith(prefix)) continue;
         if (nb->uid() == legacyUid) {
-            // Retire the v1 notebook entirely (events move to per-cal notebooks).
-            if (storage->deleteNotebook(nb)) {
-                proton_log(QStringLiteral("Retired legacy notebook ") + legacyUid);
-            }
+            // Notebook deletion is immediate: defer until replacement saved.
+            legacyNotebook = nb;
             continue;
         }
-        if (!storage->loadNotebookIncidences(nb->uid())) continue;
+        if (!storage->loadNotebookIncidences(nb->uid())) return false;
         KCalendarCore::Incidence::List existing = cal->incidences(nb->uid());
         int removed = 0;
         for (const KCalendarCore::Incidence::Ptr &inc : existing) {
             KCalendarCore::Event::Ptr ev = inc.dynamicCast<KCalendarCore::Event>();
-            if (ev && cal->deleteEvent(ev)) {
+            if (ev) {
+                if (!cal->deleteEvent(ev)) return false;
                 removedUids.insert(ev->uid());
                 removed++;
             }
@@ -2113,10 +2111,11 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
     };
     for (auto it = byCal.constBegin(); it != byCal.constEnd(); ++it) {
         QString nbUid = findOrCreateNotebook(cal, storage, it.key(), calNames.value(it.key()));
-        if (nbUid.isEmpty()) continue;
+        if (nbUid.isEmpty()) return false;
         if (!syncedNotebooks.contains(nbUid)) syncedNotebooks << nbUid;
         if (!storage->loadNotebookIncidences(nbUid)) {
-            proton_log(QStringLiteral("loadNotebookIncidences failed, continuing anyway"));
+            proton_log(QStringLiteral("loadNotebookIncidences failed; import aborted"));
+            return false;
         }
         // Pass 1: masters (no recurrence-id). Pass 2 decomposes exceptions
         // into master-EXDATE + standalone edited event (T15).
@@ -2140,6 +2139,7 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
                 saved++;
             } else {
                 proton_log(QStringLiteral("addEvent failed uid=") + uid.left(64));
+                return false;
             }
             continue;
         }
@@ -2168,24 +2168,32 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
             saved++;
         } else {
             proton_log(QStringLiteral("addEvent exception failed uid=") + uid.left(64));
+            return false;
         }
         continue;
         } // per-event rows of this Proton calendar
         } // pass 1 masters / pass 2 exceptions
     } // per Proton calendar notebook
-    if (!storage->save()) {
+    // These deletions are replacement artifacts, never user tombstones.
+    // Remove them in the save itself, so a crash before the later purge
+    // cannot leave a false delete for the next upsync. Previously persisted
+    // user tombstones are still handled selectively below.
+    if (!storage->save(mKCal::ExtendedStorage::PurgeDeleted)) {
         proton_log(QStringLiteral("mKCal storage save failed"));
         return false;
     }
     proton_log(QStringLiteral("Saved %1 calendar events to mkcal").arg(saved));
+    if (legacyNotebook && storage->deleteNotebook(legacyNotebook)) {
+        proton_log(QStringLiteral("Retired legacy notebook ") + legacyUid);
+    }
     // Upsync bookkeeping (write-only today; consumed at wiring): per-row
     // Proton IDs, server-mtime anchors and lastModified snapshots so the
     // planner can map local inventory → server ops and detect dirt.
     persistUpsyncMaps(arr, cal);
     // Tombstone purge: selective for our notebooks (planner purgeable set
     // ∪ replacement-phase removals — the union covers both user deletes
-    // whose server deletes uploaded OK and sync-artifact tombstones from
-    // the replacement above). The retired v1 notebook keeps the legacy
+    // whose server deletes uploaded OK and stale sync artifacts from older
+    // versions). The retired v1 notebook keeps the legacy
     // unconditional purge (no live data, only lingering tombstones).
     // Fail-closed: m_purgeableUids is only populated from a `complete`
     // engine run whose uploads succeeded; any upload error aborts the

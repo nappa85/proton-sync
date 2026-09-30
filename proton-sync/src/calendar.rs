@@ -238,7 +238,7 @@ impl CalendarSyncEngine {
         // afterwards — same token, same params. Cause unknown (server-side
         // read-state); ordering around it is the reliable path.
         let cal_client = Self::calendar_client(config, &access_token, &uid);
-        let cals = cal_client.list_calendars().unwrap_or_default();
+        let cals = cal_client.list_calendars()?;
         let mut out = Vec::new();
         let mut query_errors: Vec<String> = Vec::new();
         let mut fetched: Vec<(proton_api::Calendar, Vec<CalendarEvent>)> = Vec::new();
@@ -339,6 +339,14 @@ impl CalendarSyncEngine {
                     query_errors.push(format!("{}:{e}", &cal.ID[..8.min(cal.ID.len())]));
                 }
             }
+        }
+        // The shim replaces all account notebooks. A partial snapshot would
+        // erase events from calendars whose query failed, even if others worked.
+        if !query_errors.is_empty() {
+            return Err(proton_api::ProtonError::Api {
+                code: 0,
+                message: format!("Calendar event queries failed: {}", query_errors.join("; ")),
+            });
         }
         // Unlock user + address keys (same Token-aware logic as contacts engine).
         let mut keys = self.unlock_address_keys(&access_token, &uid, config)?;
@@ -448,6 +456,14 @@ impl CalendarSyncEngine {
                     cached,
                 ) {
                     out.push(json);
+                } else {
+                    return Err(proton_api::ProtonError::Api {
+                        code: 0,
+                        message: format!(
+                            "Calendar event {} could not be decoded; local events preserved",
+                            ev.ID
+                        ),
+                    });
                 }
             }
         }
@@ -465,13 +481,6 @@ impl CalendarSyncEngine {
                     msg.chars().take(80).collect::<String>()
                 ));
             }
-        }
-        // Never report a silent empty success when every query failed.
-        if out.is_empty() && !query_errors.is_empty() {
-            return Err(proton_api::ProtonError::Api {
-                code: 0,
-                message: format!("Calendar event queries failed: {}", query_errors.join("; ")),
-            });
         }
         Ok(out)
     }
@@ -1130,6 +1139,8 @@ impl CalendarSyncEngine {
                 fragments.push(plain);
             } else if (part.Type & 1) == 0 {
                 fragments.push(part.Data.clone());
+            } else {
+                return None;
             }
         }
         for part in &ev.CalendarEvents {
@@ -1142,6 +1153,8 @@ impl CalendarSyncEngine {
                 fragments.push(plain);
             } else if (part.Type & 1) == 0 {
                 fragments.push(part.Data.clone());
+            } else {
+                return None;
             }
         }
         for part in &ev.AttendeesEvents {
@@ -1152,6 +1165,8 @@ impl CalendarSyncEngine {
             };
             if let Ok(plain) = cal_api::decrypt_calendar_part(part, cal_keys, addr_keys, kp) {
                 fragments.push(plain);
+            } else {
+                return None;
             }
         }
         // PersonalEvents carry member reminders; Notifications row is source of
@@ -1159,7 +1174,7 @@ impl CalendarSyncEngine {
         let parsed = if fragments.is_empty() {
             cal_api::ParsedCalendarEvent::default()
         } else {
-            cal_api::merge_ical_fragments(&fragments).unwrap_or_default()
+            cal_api::merge_ical_fragments(&fragments).ok()?
         };
         // UID fallback to row UID (signed-only rows still listable).
         let uid = if parsed.uid.is_empty() {
@@ -1520,6 +1535,68 @@ mod tests {
             username: "u".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_partial_calendar_query_failure_aborts_before_uploads() {
+        let mut server = mockito::Server::new();
+        let calendars = server
+            .mock("GET", "/calendar/v1")
+            .with_body(r#"{"Calendars":[{"ID":"good"},{"ID":"bad"}]}"#)
+            .create();
+        let good = server
+            .mock("GET", "/calendar/v1/good/events")
+            .match_query(mockito::Matcher::Any)
+            .expect_at_least(1)
+            .with_body(r#"{"Events":[],"More":0}"#)
+            .create();
+        let bad = server
+            .mock("GET", "/calendar/v1/bad/events")
+            .match_query(mockito::Matcher::Any)
+            .with_status(503)
+            .create();
+        let config = SyncConfig {
+            api_base_url: Some(server.url()),
+            access_token: Some("at".into()),
+            refresh_token: Some("rt".into()),
+            uid: Some("uid".into()),
+            ..cfg()
+        };
+        let mut engine = CalendarSyncEngine::new(config.clone());
+        engine.start_sync(config);
+        assert_eq!(engine.status().state, "error");
+        assert!(engine
+            .status()
+            .error
+            .unwrap()
+            .contains("event queries failed"));
+        assert!(lock_or_recover(&engine.events_json).is_none());
+        calendars.assert();
+        good.assert();
+        bad.assert();
+    }
+
+    #[test]
+    fn test_undecryptable_event_is_not_replaced_with_uid_placeholder() {
+        let ev = CalendarEvent {
+            UID: "existing-event".into(),
+            SharedEvents: vec![proton_api::CalendarEventPart {
+                Type: 3,
+                Data: "invalid ciphertext".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(CalendarSyncEngine::process_event(
+            &ev,
+            "c1",
+            "Calendar",
+            &mut [],
+            &mut [],
+            None,
+            None
+        )
+        .is_none());
     }
 
     #[test]

@@ -52,6 +52,7 @@ echo "========================================="
 # Prepare Buteo plugin sources
 cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.cpp" "$packaging_dir/buteo-plugin/"
+cp "$repo_root/proton-bridge/proton_log.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/proton-bridge/proton_bridge.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/target/$target_triple/release/libproton_bridge.a" "$packaging_dir/buteo-plugin/"
 
@@ -59,6 +60,7 @@ cp "$repo_root/target/$target_triple/release/libproton_bridge.a" "$packaging_dir
 mkdir -p "$packaging_dir/settings-plugin"
 cp "$repo_root/proton-bridge/settings/protonsettingsplugin.h" "$packaging_dir/settings-plugin/"
 cp "$repo_root/proton-bridge/settings/protonsettingsplugin.cpp" "$packaging_dir/settings-plugin/"
+cp "$repo_root/proton-bridge/proton_log.h" "$packaging_dir/settings-plugin/"
 cp "$repo_root/proton-bridge/settings/qmldir" "$packaging_dir/settings-plugin/"
 
 # Prepare SignOn plugin sources

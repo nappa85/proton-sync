@@ -139,6 +139,11 @@ decrypt, address-only for seal/sign, author-matched signing index) →
 upload phase (fail-closed) → per-calendar bootstrap → unlock calendar keys
 → windowed list → decrypt + merge → `CalEventJson`.
 
+Calendar-list errors, any calendar query error, skipped/unparseable event
+rows, and event decryption/merge failures abort the download snapshot. The
+shim only applies a complete result, so a failed calendar cannot disappear
+from an otherwise successful account-wide replacement.
+
 `CalEventJson`: `id, uid, calendar_id, calendar_name, summary,
 description, location, dtstart, dtend, dtstamp, rrule, exdates[], sequence,
 status, transp, organizer, organizer_name, attendees[], attendees_full[],
@@ -180,8 +185,12 @@ expose `defaults/purgeable/conflicts/anchors/pending` (`""` = no clobber).
 - `writeEventsToMkCal`: full replacement per notebook (masters first, then
   exceptions as master `EXDATE` + standalone edited event — the framework
   exception machinery does not persist dissociated rows); tombstone purge
-  scoped to our notebooks; maps persisted after every save; selective purge
-  = planner set ∪ replacement removals.
+   scoped to our notebooks; maps persisted after every save. Empty/duplicate
+   UIDs and notebook/load/add failures abort before saving the replacement.
+   Replacement deletions use `save(PurgeDeleted)` so they never become
+   uploadable user tombstones, including after an interrupted sync. Previously
+   persisted tombstones are purged selectively (planner set ∪ replacement
+   removals). Legacy notebook retirement happens after the replacement saves.
 - Calendar FFI mirrors contacts (`proton_calendar_create_engine_with_inventory`,
   `…_with_derived_and_defaults`, `…_get_events_json`,
   `…_get_{purgeable,conflicts,anchors,pending,defaults}_json`,

@@ -23,6 +23,12 @@ Card types (`CONTACT_CARD_TYPE`): `3` encrypted+armored, `2` signed
 plaintext, `1` encrypted (read like 3), `0` cleartext
 (`VERSION`/`PRODID`/`CATEGORIES`, `Signature` null or omitted).
 
+Full-card downloads use up to four concurrent blocking HTTP workers sharing
+the connection pool, with listing order preserved. Pagination continues to
+the reported total; an early empty page or any failed detail request aborts
+the snapshot before uploads/local apply. List summaries never substitute for
+missing full cards.
+
 ## vCard split and seal (`vcard.rs`, `contact_seal.rs`)
 
 Cards seal to the **user** keypair (encrypt to user-public, detached-sign

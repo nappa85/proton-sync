@@ -85,27 +85,48 @@ impl ContactsClient {
             let contacts_len = resp.Contacts.len();
             summaries.extend(resp.Contacts);
 
-            if summaries.len() >= total || contacts_len < page_size as usize {
+            if summaries.len() >= total {
                 break;
+            }
+            if contacts_len == 0 {
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Contact listing ended before the reported total".into(),
+                });
             }
             page += 1;
         }
 
-        let mut full_contacts = Vec::new();
-        for summary in &summaries {
-            match self.get(&summary.ID) {
-                Ok(full) => full_contacts.push(full),
-                Err(e) => {
-                    eprintln!(
-                        "Failed to fetch contact {}: {}, using summary",
-                        summary.ID, e
-                    );
-                    full_contacts.push(summary.clone());
-                }
-            }
+        if summaries.is_empty() {
+            return Ok(Vec::new());
         }
-
-        Ok(full_contacts)
+        // Blocking HTTP is latency-bound. Share reqwest's connection pool
+        // across a small number of workers, independent of device CPU count.
+        // Preserve listing order and fail closed: a summary has no encrypted
+        // cards and must never replace a fully populated local contact.
+        const FETCH_WORKERS: usize = 4;
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = summaries
+                .chunks(summaries.len().div_ceil(FETCH_WORKERS))
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|s| self.get(&s.ID))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+            let mut full_contacts = Vec::with_capacity(summaries.len());
+            for worker in workers {
+                let contacts = worker.join().map_err(|_| ProtonError::Api {
+                    code: 0,
+                    message: "Contact download worker failed".into(),
+                })??;
+                full_contacts.extend(contacts);
+            }
+            Ok(full_contacts)
+        })
     }
 
     /// Get single contact by ID
@@ -249,6 +270,56 @@ pub fn generate_contact_uid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_list_all_fetches_full_contacts_in_listing_order() {
+        let mut server = mockito::Server::new();
+        let list = server.mock("GET", "/contacts/v4")
+            .match_query(mockito::Matcher::Any)
+            .with_body(r#"{"Total":5,"Contacts":[{"ID":"a"},{"ID":"b"},{"ID":"c"},{"ID":"d"},{"ID":"e"}]}"#)
+            .create();
+        let details: Vec<_> = ["a", "b", "c", "d", "e"].iter().map(|id| {
+            server.mock("GET", format!("/contacts/v4/{id}").as_str())
+                .with_body(format!(r#"{{"Contact":{{"ID":"{id}","Cards":[{{"Type":2,"Data":"BEGIN:VCARD","Signature":"s"}}]}}}}"#))
+                .create()
+        }).collect();
+        let client = ContactsClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let contacts = client.list_all().unwrap();
+        assert_eq!(
+            contacts.iter().map(|c| c.ID.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c", "d", "e"]
+        );
+        assert!(contacts
+            .iter()
+            .all(|c| c.Cards.as_ref().unwrap().len() == 1));
+        list.assert();
+        for detail in details {
+            detail.assert();
+        }
+    }
+
+    #[test]
+    fn test_list_all_detail_failure_aborts_snapshot() {
+        let mut server = mockito::Server::new();
+        let list = server
+            .mock("GET", "/contacts/v4")
+            .match_query(mockito::Matcher::Any)
+            .with_body(r#"{"Total":2,"Contacts":[{"ID":"a"},{"ID":"b"}]}"#)
+            .create();
+        let good = server
+            .mock("GET", "/contacts/v4/a")
+            .with_body(r#"{"Contact":{"ID":"a"}}"#)
+            .create();
+        let bad = server
+            .mock("GET", "/contacts/v4/b")
+            .with_status(503)
+            .create();
+        let client = ContactsClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        assert!(client.list_all().is_err());
+        list.assert();
+        good.assert();
+        bad.assert();
+    }
 
     #[test]
     fn test_generate_contact_uid_shape_and_uniqueness() {
