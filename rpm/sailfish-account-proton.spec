@@ -78,6 +78,8 @@ install -m 0644 translations/*.qm \
 # %{_datadir}/icons/hicolor/*/apps/proton.png
 
 %changelog
+* Sat Oct 1 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.3-1
+- Bulk contacts fetch, per-calendar event id
 * Sat Sep 30 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.2-1
 - Improve performances and persistent logging
 * Sat Sep 12 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.1-1

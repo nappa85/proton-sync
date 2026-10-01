@@ -52,6 +52,7 @@ echo "========================================="
 # Prepare Buteo plugin sources
 cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.cpp" "$packaging_dir/buteo-plugin/"
+cp "$repo_root/proton-bridge/cxx/calendar_identity.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/proton-bridge/proton_log.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/proton-bridge/proton_bridge.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/target/$target_triple/release/libproton_bridge.a" "$packaging_dir/buteo-plugin/"
@@ -316,6 +317,7 @@ cp "$packaging_dir/buteo-plugin/libproton-client.so" \
 cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.h" \
    "$repo_root/proton-bridge/cxx/proton_bridge_shim.cpp" \
    "$repo_root/proton-bridge/proton_bridge.h" \
+   "$repo_root/proton-bridge/cxx/calendar_identity.h" \
    "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin/"
 cp "$repo_root/buteo-profiles/client/proton-contacts.xml" \
    "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/client/"

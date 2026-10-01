@@ -7,7 +7,8 @@ x-pm-appversion`. `check_response` keeps truncated error bodies.
 
 | Method | Route | Request | Response |
 |---|---|---|---|
-| `GET` | `/contacts/v4?Page=&PageSize=` | — | `{Contacts: Contact[], Total}` (`PageSize=100`, then one `GET` per contact for full cards) |
+| `GET` | `/contacts/v4?Page=&PageSize=` | — | `{Contacts: Contact[], Total}` (`PageSize=100`, metadata/ID inventory) |
+| `GET` | `/contacts/v4/contacts/export?Page=&PageSize=50` | — | `{Contacts: Contact[]}` with full encrypted cards; may repeat IDs per email |
 | `GET` | `/contacts/v4?Count=1` | — | `{Total}` |
 | `GET` | `/contacts/v4/{id}` | — | `{Contact}` |
 | `POST` | `/contacts/v4` | `{Contacts: [{Cards}], Overwrite: 0, Labels: 0}` | `{Responses: [{Index, Response{Code, Error?, Contact?}}]}` (nested `Contact`) |
@@ -23,11 +24,14 @@ Card types (`CONTACT_CARD_TYPE`): `3` encrypted+armored, `2` signed
 plaintext, `1` encrypted (read like 3), `0` cleartext
 (`VERSION`/`PRODID`/`CATEGORIES`, `Signature` null or omitted).
 
-Full-card downloads use up to four concurrent blocking HTTP workers sharing
-the connection pool, with listing order preserved. Pagination continues to
-the reported total; an early empty page or any failed detail request aborts
-the snapshot before uploads/local apply. List summaries never substitute for
-missing full cards.
+Full-card downloads use sequential export pages of 50, deduplicated by ID,
+with listing order and metadata preserved. The complete ID inventory must
+match the export before uploads/local apply. Conflicting duplicate cards,
+missing IDs, changing totals and stalled pagination abort the snapshot.
+Explicitly unavailable export routes (404/501) use paced single-contact
+reads; omitted cards can trigger at most 10 targeted detail reads. HTTP
+429/5xx never trigger a per-contact fallback. Requests through each contacts
+client are spaced at least 100 ms apart, including writes.
 
 ## vCard split and seal (`vcard.rs`, `contact_seal.rs`)
 

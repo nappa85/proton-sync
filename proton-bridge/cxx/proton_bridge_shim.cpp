@@ -1,4 +1,5 @@
 #include "proton_bridge_shim.h"
+#include "calendar_identity.h"
 #include "proton_log.h"
 #include <QBuffer>
 #include <QDebug>
@@ -1421,6 +1422,10 @@ void ProtonCalendarPlugin::onCalendarSignOnResponse(const SignOn::SessionData &d
         emit error(getProfileName(), QStringLiteral("Failed to create calendar engine"), Buteo::SyncResults::INTERNAL_ERROR);
         return;
     }
+    QSettings snapshotSettings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    snapshotSettings.beginGroup(m_accountId);
+    QByteArray snapshot = snapshotSettings.value(QStringLiteral("calendar_snapshot")).toString().toUtf8();
+    proton_calendar_restore_snapshot(m_calEngine, snapshot.constData());
     m_credentialsReady = true;
     m_calTimer = new QTimer(this);
     connect(m_calTimer, &QTimer::timeout, this, &ProtonCalendarPlugin::pollCalendarStatus);
@@ -1512,6 +1517,14 @@ void ProtonCalendarPlugin::pollCalendarStatus() {
             QByteArray jsonData(json);
             proton_bridge_free_string(json);
             if (writeEventsToMkCal(jsonData)) {
+                char *snapshot = proton_calendar_get_snapshot_json(m_calEngine);
+                if (snapshot && *snapshot) {
+                    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+                    settings.beginGroup(m_accountId);
+                    settings.setValue(QStringLiteral("calendar_snapshot"), QString::fromUtf8(snapshot));
+                    settings.sync();
+                }
+                if (snapshot) proton_bridge_free_string(snapshot);
                 emit success(getProfileName(), QStringLiteral("Calendar sync completed"));
             } else {
                 emit error(getProfileName(), QStringLiteral("Failed to write calendar events"), Buteo::SyncResults::INTERNAL_ERROR);
@@ -1525,6 +1538,13 @@ void ProtonCalendarPlugin::pollCalendarStatus() {
         QString errMsg = QString::fromUtf8(reinterpret_cast<const char*>(status.error),
                                            strnlen(reinterpret_cast<const char*>(status.error), 256));
         proton_log(QStringLiteral("Calendar sync error: ") + errMsg);
+        // A successful token refresh can precede a failed download. Keep
+        // the rotated token even then, avoiding another login next cycle.
+        char *rt = proton_calendar_get_refresh_token(m_calEngine);
+        char *uid = proton_calendar_get_uid(m_calEngine);
+        if (rt && uid && *rt && *uid) persistCalendarTokens(QString::fromUtf8(rt), QString::fromUtf8(uid));
+        if (rt) proton_bridge_free_string(rt);
+        if (uid) proton_bridge_free_string(uid);
         // The error path is exactly when posted-but-unconfirmed creates
         // exist (e.g. re-list failed after successful POSTs): persist the
         // pending retry UIDs wholesale so the next cycle reuses them.
@@ -1621,9 +1641,11 @@ QString ProtonCalendarPlugin::findOrCreateNotebook(mKCal::ExtendedCalendar::Ptr 
 // 105) re-inserts the same UIDs next to the orphaned notebooks and the
 // batch INSERT fails, rolling back the entire save() (verified 2026-09-06:
 // deterministic "mKCal storage save failed"). Namespace every stored UID
-// by account; lookups must use the same form.
-QString ProtonCalendarPlugin::namespacedUid(const QString &raw) const {
-    return QStringLiteral("proton-cal-%1-%2").arg(m_accountId, raw);
+// by account AND calendar: invitations can also exist in a shared calendar.
+// Lookups and persisted maps must use the same form.
+QString ProtonCalendarPlugin::namespacedUid(const QString &calId, const QString &raw,
+                                            qint64 recurrenceId) const {
+    return CalendarIdentity::storedUid(m_accountId, calId, raw, recurrenceId);
 }
 
 static QString stripMailto(const QString &s) {
@@ -1850,6 +1872,7 @@ static void fillEventFromJson(const KCalendarCore::Event::Ptr &ev, const QJsonOb
     if (!protonId.isEmpty()) {
         ev->setCustomProperty("PROTON", "EVENT-ID", protonId);
     }
+    ev->setCustomProperty("PROTON", "ICAL-UID", o.value(QLatin1String("uid")).toString());
     QString summary = o.value(QLatin1String("summary")).toString();
     ev->setSummary(summary.isEmpty() ? uid : summary);
     ev->setDescription(o.value(QLatin1String("description")).toString());
@@ -2046,25 +2069,42 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
     QJsonArray arr = doc.array();
     // Validate identities before touching notebooks. Duplicate/empty UIDs
     // cannot be inserted reliably and must not turn replacement into deletion.
-    QSet<QString> incomingUids;
-    for (const QJsonValue &value : arr) {
-        QJsonObject row = value.toObject();
+    auto identityDetails = [](const QJsonObject &row, int index) {
+        QJsonObject identity;
+        identity.insert(QStringLiteral("row"), index);
+        for (const QString &key : {QStringLiteral("id"), QStringLiteral("uid"),
+                                  QStringLiteral("calendar_id"), QStringLiteral("calendar_name"),
+                                  QStringLiteral("recurrence_id")}) {
+            identity.insert(key, row.value(key));
+        }
+        return QString::fromUtf8(QJsonDocument(identity).toJson(QJsonDocument::Compact));
+    };
+    QMap<QString, int> incomingUids;
+    for (int i = 0; i < arr.size(); ++i) {
+        QJsonObject row = arr.at(i).toObject();
         QString uid = row.value(QLatin1String("uid")).toString();
         qint64 rid = row.value(QLatin1String("recurrence_id")).toVariant().toLongLong();
-        QString storedUid = rid > 0 ? QStringLiteral("%1#%2").arg(uid, QString::number(rid)) : uid;
+        QString storedUid = namespacedUid(row.value(QLatin1String("calendar_id")).toString(), uid, rid);
         if (uid.isEmpty() || incomingUids.contains(storedUid)) {
             proton_log(QStringLiteral("Invalid or duplicate calendar event UID; import aborted"));
+            proton_log(QStringLiteral("Calendar identity failure: reason=%1 incoming=%2")
+                       .arg(uid.isEmpty() ? QStringLiteral("empty_uid") : QStringLiteral("duplicate_uid"),
+                            identityDetails(row, i)));
+            if (!uid.isEmpty()) {
+                int previous = incomingUids.value(storedUid);
+                proton_log(QStringLiteral("Calendar identity conflict: previous=%1")
+                           .arg(identityDetails(arr.at(previous).toObject(), previous)));
+            }
             return false;
         }
-        incomingUids.insert(storedUid);
+        incomingUids.insert(storedUid, i);
     }
     // Group rows by Proton calendar (one notebook each, T20 separation).
     QMap<QString, QString> calNames;
     QMap<QString, QList<int>> byCal;
     for (int i = 0; i < arr.size(); ++i) {
         QJsonObject o = arr.at(i).toObject();
-        QString cid = o.value(QLatin1String("calendar_id")).toString();
-        if (cid.isEmpty()) cid = QStringLiteral("default");
+        QString cid = CalendarIdentity::calendarId(o.value(QLatin1String("calendar_id")).toString());
         if (!calNames.contains(cid)) {
             calNames[cid] = o.value(QLatin1String("calendar_name")).toString();
         }
@@ -2134,7 +2174,7 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         if (!isException) {
             KCalendarCore::Event::Ptr ev(new KCalendarCore::Event());
             fillEventFromJson(ev, o, uid, start, end, fullDay);
-            ev->setUid(namespacedUid(uid));
+            ev->setUid(namespacedUid(it.key(), uid));
             if (cal->addEvent(ev, nbUid)) {
                 saved++;
             } else {
@@ -2152,7 +2192,7 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         // as a plain event with a stable suffixed UID. Display result is
         // identical; no recurrenceId anywhere.
         QDateTime rid = utcFromUnix(recurrenceId);
-        KCalendarCore::Event::Ptr master = cal->event(namespacedUid(uid));
+        KCalendarCore::Event::Ptr master = cal->event(namespacedUid(it.key(), uid));
         if (master && master->recursAt(rid)) {
             master->recurrence()->addExDateTime(rid);
         } else if (master) {
@@ -2163,7 +2203,7 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         KCalendarCore::Event::Ptr solo(new KCalendarCore::Event());
         QString soloUid = QStringLiteral("%1#%2").arg(uid, QString::number(recurrenceId));
         fillEventFromJson(solo, o, soloUid, start, end, fullDay);
-        solo->setUid(namespacedUid(soloUid));
+        solo->setUid(namespacedUid(it.key(), uid, recurrenceId));
         if (cal->addEvent(solo, nbUid)) {
             saved++;
         } else {
@@ -2236,9 +2276,8 @@ void ProtonCalendarPlugin::persistUpsyncMaps(const QJsonArray &arr,
         QString protonId = o.value(QLatin1String("id")).toString();
         if (protonId.isEmpty()) continue;
         qint64 recurrenceId = o.value(QLatin1String("recurrence_id")).toVariant().toLongLong();
-        QString storedUid = recurrenceId > 0
-            ? namespacedUid(QStringLiteral("%1#%2").arg(uid, QString::number(recurrenceId)))
-            : namespacedUid(uid);
+        QString storedUid = namespacedUid(o.value(QLatin1String("calendar_id")).toString(),
+                                          uid, recurrenceId);
         idMap.insert(storedUid, protonId);
         bool mtimeOk = false;
         qint64 mtime = o.value(QLatin1String("mtime")).toVariant().toLongLong(&mtimeOk);
@@ -2425,15 +2464,15 @@ QJsonArray ProtonCalendarPlugin::exportLocalInventory() {
             if (protonId.isEmpty()) protonId = idMap.value(inc->uid()).toString();
             o.insert(QStringLiteral("proton_id"),
                      protonId.isEmpty() ? QJsonValue() : QJsonValue(protonId));
-            // Raw iCal UID for the out-of-window fallback (strip the
-            // account namespace + any #rid exception suffix): lets the
-            // engine UID-list rows the windowed listing missed.
-            QString rawUid = inc->uid();
-            if (rawUid.startsWith(prefix)) rawUid = rawUid.mid(prefix.length());
-            int hash = rawUid.indexOf('#');
-            if (hash >= 0) rawUid = rawUid.left(hash);
+            // Wire identity is separate from storage identity, including
+            // old account-only UIDs during migration and tombstones which
+            // have lost their custom properties.
+            QString rawUid = inc->customProperty("PROTON", "ICAL-UID");
+            if (rawUid.isEmpty()) rawUid = CalendarIdentity::rawUid(inc->uid(), m_accountId, calId);
             o.insert(QStringLiteral("uid"),
-                     rawUid.isEmpty() ? QJsonValue() : QJsonValue(rawUid));
+                      rawUid.isEmpty() ? QJsonValue() : QJsonValue(rawUid));
+            o.insert(QStringLiteral("calendar_id"),
+                     calId.isEmpty() ? QJsonValue() : QJsonValue(calId));
             o.insert(QStringLiteral("deleted"), true);
             o.insert(QStringLiteral("modified"), false);
             if (!protonId.isEmpty() && anchors.contains(protonId)) {

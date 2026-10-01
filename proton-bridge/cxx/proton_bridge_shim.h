@@ -142,7 +142,7 @@ private:
                                  mKCal::ExtendedStorage::Ptr storage,
                                  const QString &calId,
                                  const QString &calName);
-    QString namespacedUid(const QString &raw) const;
+    QString namespacedUid(const QString &calId, const QString &raw, qint64 recurrenceId = 0) const;
     void persistCalendarTokens(const QString &refreshToken, const QString &uid);
     QPair<QString, QString> loadPersistedCalendarTokens();
     void persistCalendarDefaults(const QString &defaultsJson);

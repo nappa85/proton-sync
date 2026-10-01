@@ -13,11 +13,19 @@ use std::time::Duration;
 pub const CALENDAR_MAX_WINDOW_SECS: i64 = 93 * 86400;
 pub const CALENDAR_PAGE_SIZE: u32 = 100;
 
+pub struct CalendarModelChanges {
+    pub cursor: String,
+    pub more: bool,
+    pub refresh: bool,
+    pub events: Vec<(String, u8)>,
+}
+
 pub struct CalendarClient {
     client: reqwest::blocking::Client,
     base_url: String,
     access_token: String,
     uid: String,
+    pacer: crate::client::RequestPacer,
 }
 
 impl CalendarClient {
@@ -27,6 +35,7 @@ impl CalendarClient {
             base_url: API_BASE.to_string(),
             access_token,
             uid,
+            pacer: Default::default(),
         }
     }
 
@@ -36,6 +45,7 @@ impl CalendarClient {
             base_url,
             access_token,
             uid,
+            pacer: Default::default(),
         }
     }
 
@@ -44,6 +54,7 @@ impl CalendarClient {
     }
 
     pub fn list_calendars(&self) -> Result<Vec<Calendar>> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!("{}/calendar/v1", self.base_url))
@@ -54,12 +65,154 @@ impl CalendarClient {
             .error_for_status()?;
         let text = resp.text()?;
         let v: serde_json::Value = serde_json::from_str(&text)?;
-        let cals: Vec<Calendar> =
-            serde_json::from_value(v["Calendars"].clone()).unwrap_or_default();
+        if v.get("Code")
+            .and_then(|c| c.as_i64())
+            .is_some_and(|c| c != 1000)
+        {
+            return Err(ProtonError::Api {
+                code: 0,
+                message: "Calendar listing rejected".into(),
+            });
+        }
+        let cals: Vec<Calendar> = serde_json::from_value(v["Calendars"].clone())?;
+        if cals.iter().any(|cal| cal.ID.is_empty()) {
+            return Err(ProtonError::Api {
+                code: 0,
+                message: "Calendar list contains an empty ID".into(),
+            });
+        }
         Ok(cals)
     }
 
+    fn fetch_model(&self, cal_id: &str, cursor: &str) -> Result<Option<serde_json::Value>> {
+        self.pacer.wait();
+        let response = self
+            .client
+            .get(format!(
+                "{}/calendar/v1/{cal_id}/modelevents/{cursor}",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .header("x-pm-uid", &self.uid)
+            .header("x-pm-appversion", APP_VERSION)
+            .send()?;
+        if matches!(response.status().as_u16(), 404 | 410 | 501) {
+            return Ok(None); // Unsupported or expired cursor: full refresh.
+        }
+        if response.status().as_u16() == 400 {
+            let value: serde_json::Value = response.json()?;
+            if cursor != "latest" && value.get("Code").and_then(|c| c.as_i64()) == Some(2061) {
+                return Ok(None); // Proton INVALID_ID_ERROR, not auth/rate limiting.
+            }
+            return Err(ProtonError::Api {
+                code: 0,
+                message: "Calendar change feed rejected with HTTP 400".into(),
+            });
+        }
+        let response = response.error_for_status()?;
+        let value: serde_json::Value = response.json()?;
+        if value
+            .get("Code")
+            .and_then(|c| c.as_i64())
+            .is_some_and(|c| c != 1000)
+        {
+            return Err(ProtonError::Api {
+                code: 0,
+                message: "Calendar change feed rejected".into(),
+            });
+        }
+        Ok(Some(value))
+    }
+
+    pub fn latest_model_event_id(&self, cal_id: &str) -> Result<Option<String>> {
+        self.fetch_model(cal_id, "latest")?
+            .map(|value| {
+                value
+                    .get("CalendarModelEventID")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| ProtonError::Api {
+                        code: 0,
+                        message: "Calendar change feed has no cursor".into(),
+                    })
+            })
+            .transpose()
+    }
+
+    pub fn model_changes(
+        &self,
+        cal_id: &str,
+        cursor: &str,
+    ) -> Result<Option<CalendarModelChanges>> {
+        let Some(value) = self.fetch_model(cal_id, cursor)? else {
+            return Ok(None);
+        };
+        let flag = |key: &str, optional: bool| -> Result<bool> {
+            match value.get(key) {
+                Some(serde_json::Value::Bool(v)) => Ok(*v),
+                Some(serde_json::Value::Number(v)) => {
+                    v.as_u64().map(|n| n != 0).ok_or_else(|| ProtonError::Api {
+                        code: 0,
+                        message: format!("Invalid calendar {key} flag"),
+                    })
+                }
+                None if optional => Ok(false),
+                _ => Err(ProtonError::Api {
+                    code: 0,
+                    message: format!("Missing calendar {key} flag"),
+                }),
+            }
+        };
+        let next = value
+            .get("CalendarModelEventID")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ProtonError::Api {
+                code: 0,
+                message: "Calendar change feed has no cursor".into(),
+            })?;
+        let mut events = Vec::new();
+        match value.get("CalendarEvents") {
+            Some(serde_json::Value::Array(rows)) => {
+                for row in rows {
+                    let id = row
+                        .get("ID")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    let action = row
+                        .get("Action")
+                        .and_then(|v| v.as_u64())
+                        .filter(|n| *n <= 2);
+                    match (id, action) {
+                        (Some(id), Some(action)) => events.push((id.to_owned(), action as u8)),
+                        _ => {
+                            return Err(ProtonError::Api {
+                                code: 0,
+                                message: "Invalid calendar change record".into(),
+                            })
+                        }
+                    }
+                }
+            }
+            None | Some(serde_json::Value::Null) => {}
+            _ => {
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Invalid calendar change array".into(),
+                })
+            }
+        }
+        Ok(Some(CalendarModelChanges {
+            cursor: next.to_owned(),
+            more: flag("More", false)?,
+            refresh: flag("Refresh", true)?,
+            events,
+        }))
+    }
+
     pub fn get_calendar_keys(&self, cal_id: &str) -> Result<Vec<CalendarKey>> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!("{}/calendar/v1/{}/keys", self.base_url, cal_id))
@@ -74,6 +227,7 @@ impl CalendarClient {
     }
 
     pub fn get_passphrase(&self, cal_id: &str) -> Result<CalendarPassphrase> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!(
@@ -90,6 +244,7 @@ impl CalendarClient {
     }
 
     pub fn get_members(&self, cal_id: &str) -> Result<Vec<CalendarMember>> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!("{}/calendar/v1/{}/members", self.base_url, cal_id))
@@ -107,6 +262,7 @@ impl CalendarClient {
     /// Consolidated bootstrap (only v2 route, api.md): Keys + Passphrase +
     /// Members in one call. Falls back to three v1 calls if v2 is unavailable.
     pub fn get_bootstrap(&self, cal_id: &str) -> Result<CalendarBootstrap> {
+        self.pacer.wait();
         let v2 = self
             .client
             .get(format!(
@@ -180,6 +336,7 @@ impl CalendarClient {
 
     /// Raw settings payloads for diagnostics (v1 + account-level).
     pub fn fetch_settings_raw(&self, cal_id: &str) -> Result<(serde_json::Value, u16)> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!("{}/calendar/v1/{}/settings", self.base_url, cal_id))
@@ -198,6 +355,7 @@ impl CalendarClient {
     /// Raw per-account calendar user settings (`DefaultCalendarID` lives
     /// here; default reminder sets may too — verified live).
     pub fn fetch_account_calendar_settings_raw(&self) -> Result<(serde_json::Value, u16)> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!("{}/settings/calendar", self.base_url))
@@ -261,7 +419,7 @@ impl CalendarClient {
             _ => v
                 .get("Total")
                 .and_then(|t| t.as_u64())
-                .is_some_and(|total| u64::from(page) * u64::from(CALENDAR_PAGE_SIZE) < total),
+                .is_some_and(|total| (u64::from(page) + 1) * u64::from(CALENDAR_PAGE_SIZE) < total),
         };
         (events, more)
     }
@@ -281,6 +439,17 @@ impl CalendarClient {
                         .into(),
                 });
             }
+        } else {
+            return Err(ProtonError::Api {
+                code: 0,
+                message: "Calendar page has no Events array; snapshot incomplete".into(),
+            });
+        }
+        if events.iter().any(|event| event.ID.is_empty()) || (more && events.is_empty()) {
+            return Err(ProtonError::Api {
+                code: 0,
+                message: "Calendar page has invalid IDs or non-progressing pagination".into(),
+            });
         }
         Ok((events, more))
     }
@@ -291,6 +460,7 @@ impl CalendarClient {
         cal_id: &str,
         params: &[(&str, String)],
     ) -> Result<(u16, String)> {
+        self.pacer.wait();
         let pairs: Vec<(String, String)> = params
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
@@ -480,6 +650,7 @@ impl CalendarClient {
     }
 
     pub fn get_event(&self, cal_id: &str, event_id: &str) -> Result<CalendarEvent> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!(
@@ -554,6 +725,7 @@ impl CalendarClient {
         end: i64,
     ) -> Result<Vec<CalendarEvent>> {
         let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut page = 0u32;
         loop {
             let params = vec![
@@ -569,6 +741,16 @@ impl CalendarClient {
             }
             let v: serde_json::Value = serde_json::from_str(&body)?;
             let (evs, more) = Self::parse_complete_events_envelope(&v, page)?;
+            let new_ids = evs
+                .iter()
+                .filter(|event| seen.insert(event.ID.clone()))
+                .count();
+            if more && new_ids == 0 {
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Calendar listing pagination repeated a page".into(),
+                });
+            }
             let raw = evs.len();
             let mut kept = 0usize;
             for ev in evs {
@@ -593,7 +775,10 @@ impl CalendarClient {
             }
             page += 1;
             if page > 1000 {
-                break;
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Calendar listing pagination limit exceeded".into(),
+                });
             }
         }
         dedupe_events(&mut out);
@@ -1350,6 +1535,22 @@ pub struct ParsedCalendarEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_empty_reminders_do_not_trigger_redundant_settings_requests() {
+        let mut server = mockito::Server::new();
+        let bootstrap = server.mock("GET", "/calendar/v2/cal/bootstrap")
+            .with_body(r#"{"Members":[{"ID":"member"}],"Keys":[],"CalendarSettings":{"DefaultPartDayNotifications":[],"DefaultFullDayNotifications":[]}}"#).create();
+        let settings = server
+            .mock("GET", "/calendar/v1/cal/settings")
+            .expect(0)
+            .create();
+        let client =
+            super::CalendarClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let result = client.get_bootstrap("cal").unwrap();
+        assert!(!result.Settings.unwrap().is_empty());
+        bootstrap.assert();
+        settings.assert();
+    }
     use super::*;
 
     #[test]

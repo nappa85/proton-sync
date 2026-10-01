@@ -15,6 +15,8 @@ x-pm-appversion`.
 | `GET` | `…/events?UID&Page&PageSize` | Server-side UID filter (no window) |
 | `GET` | `…/events?Page&PageSize` | Untyped listing (no `Type`) |
 | `GET` | `…/events/{eventId}` | Single event (`{Event: {}}`) |
+| `GET` | `/calendar/v1/{id}/modelevents/latest` | Initial per-calendar change cursor |
+| `GET` | `/calendar/v1/{id}/modelevents/{cursor}` | Paged change metadata, next cursor, `More` / `Refresh` |
 | `PUT` | `/calendar/v1/{id}/events/sync` | Batch write (only write route; no standalone POST) |
 | `PUT` | `/calendar/v1/{id}/events/{eventId}/personal` | Reminder/color-only update (`{Notifications, Color}`) |
 
@@ -48,6 +50,19 @@ spans stay ≤93d). The engine's primary listing is **untyped** paged
 EndTime > start`; recurring masters always kept). The typed windowed listing
 is retained mock-tested beside it. Cancelled events are omitted from
 listing server-side.
+
+The sync engine retains complete encrypted listings in a versioned
+`calendar_snapshot` cache under the account's QSettings group. Subsequent
+downloads drain each calendar's model-event cursor, fetch each created or
+updated event once, and apply deletions without detail requests. The initial
+cursor is captured **before** the full listing, so racing edits replay next
+time. Full refresh is used for absent/invalid caches, expired/unsupported
+cursors, server `Refresh`, or a baseline older than seven days. Network,
+rate-limit and malformed-feed errors preserve the previous snapshot instead
+of triggering another full download. The cache includes out-of-window rows;
+the ±1-year display window is applied locally on every run. Cached snapshots
+are scoped to the authenticated UID and committed only after mKCal saves.
+Calendar listing, detail, cursor and bootstrap requests are paced at 100 ms.
 
 ## Decrypt and merge (`calendar.rs`, `crypto.rs`)
 
@@ -167,9 +182,12 @@ expose `defaults/purgeable/conflicts/anchors/pending` (`""` = no clobber).
 
 - One mKCal notebook per Proton calendar
   (`proton-calendar-<accountId>-<calendarId>`, legacy single notebook
-  retired); stored UID `proton-cal-<accountId>-<raw>` (mKCal enforces
-  storage-wide uniqueness); exceptions `<uid>#<rid>`; Proton row ID in the
-  `X-PROTON-EVENT-ID` custom property (id-map fallback).
+  retired); stored UID `proton-cal-<accountId>-<base64url(calendarId)>:<base64url(raw)>`
+  (mKCal enforces storage-wide uniqueness); exceptions append `#<rid>`.
+  Calendar scoping lets invitation and shared-calendar copies coexist with
+  the same wire UID. Raw UID is also stored in `X-PROTON-ICAL-UID`; old
+  account-only identities remain upload inputs until successful replacement.
+  Proton row ID is stored in `X-PROTON-EVENT-ID` (id-map fallback).
 - `fillEventFromJson`: summary (empty → UID), description, location, all-day
   (exclusive-end adjusted), start/end (iCal or unix fallback, event timezone
   attached), recurrence (`FREQ/INTERVAL/COUNT/UNTIL/BYDAY/BYMONTHDAY/BYMONTH/
@@ -185,8 +203,11 @@ expose `defaults/purgeable/conflicts/anchors/pending` (`""` = no clobber).
 - `writeEventsToMkCal`: full replacement per notebook (masters first, then
   exceptions as master `EXDATE` + standalone edited event — the framework
   exception machinery does not persist dissociated rows); tombstone purge
-   scoped to our notebooks; maps persisted after every save. Empty/duplicate
-   UIDs and notebook/load/add failures abort before saving the replacement.
+  scoped to our notebooks; maps persisted after every save. Empty/duplicate
+  identities within one calendar and notebook/load/add failures abort before
+  saving the replacement. UID-based tombstone lookup and series deletes are
+  scoped to the owning calendar; standalone exception deletes affect only
+  that occurrence.
    Replacement deletions use `save(PurgeDeleted)` so they never become
    uploadable user tombstones, including after an interrupted sync. Previously
    persisted tombstones are purged selectively (planner set ∪ replacement
@@ -194,7 +215,10 @@ expose `defaults/purgeable/conflicts/anchors/pending` (`""` = no clobber).
 - Calendar FFI mirrors contacts (`proton_calendar_create_engine_with_inventory`,
   `…_with_derived_and_defaults`, `…_get_events_json`,
   `…_get_{purgeable,conflicts,anchors,pending,defaults}_json`,
-  `…_get_refresh_token/uid/keys_debug`).
+   `…_get_refresh_token/uid/keys_debug`).
+  `proton_calendar_restore_snapshot` supplies the saved encrypted snapshot;
+  `…_get_snapshot_json` supplies its replacement after a complete cycle.
+  Rotated refresh tokens are also persisted when a later download fails.
 
 ## References
 

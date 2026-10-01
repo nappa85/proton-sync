@@ -40,8 +40,8 @@ use std::collections::{HashMap, HashSet};
 /// shim↔engine inventory JSON contract.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalItem {
-    /// mKCal UID (namespaced `proton-cal-<acct>-…`, exception standalones
-    /// carry the `<uid>#<rid>` suffix form).
+    /// mKCal UID (account/calendar scoped; exception standalones carry a
+    /// `#<rid>` suffix). Old account-only UIDs remain valid during migration.
     pub mkcal_uid: String,
     /// Proton row event ID (`CalendarEvent.ID`), if ever synced.
     pub proton_id: Option<String>,
@@ -57,7 +57,7 @@ pub struct LocalItem {
     #[serde(default)]
     pub fields: Option<proton_api::calendar_write::LocalFields>,
     /// Proton calendar ID owning the row (parsed by the shim from the
-    /// notebook UID; needed to route creates, which have no server row).
+    /// notebook UID; routes creates and scopes UID-only tombstone lookup).
     #[serde(default)]
     pub calendar_id: Option<String>,
     /// Raw iCal UID (prefix/suffix stripped from the stored UID) for
@@ -169,9 +169,9 @@ impl SyncCycle {
 /// series-delete completeness: deleting a master ORPHANS its exceptions
 /// (no server cascade), so one batch must carry them all
 /// (`SyncBatchRequest::delete_batch`).
-pub fn ids_for_uid(rows: &[proton_api::CalendarEvent], uid: &str) -> Vec<String> {
+pub fn ids_for_uid(rows: &[proton_api::CalendarEvent], calendar: &str, uid: &str) -> Vec<String> {
     rows.iter()
-        .filter(|r| r.UID == uid)
+        .filter(|r| r.CalendarID == calendar && r.UID == uid)
         .map(|r| r.ID.clone())
         .collect()
 }
@@ -219,7 +219,8 @@ pub fn assemble_delete_batch(
             continue;
         };
         let group = match by_id.get(proton_id.as_str()) {
-            Some(row) => ids_for_uid(server, &row.UID),
+            Some(row) if row.RecurrenceID.is_some_and(|rid| rid > 0) => vec![row.ID.clone()],
+            Some(row) => ids_for_uid(server, &row.CalendarID, &row.UID),
             None => vec![proton_id.clone()],
         };
         for id in group {
@@ -334,8 +335,22 @@ pub fn plan_sync(server: &[proton_api::CalendarEvent], local: &[LocalItem]) -> S
             // back to the orphan path (nothing to upload).
             (None, true) => {
                 let resolved = item.uid.as_deref().and_then(|uid| {
-                    let rows = server_by_uid.get(uid)?;
+                    let rows: Vec<_> = server_by_uid
+                        .get(uid)?
+                        .iter()
+                        .copied()
+                        .filter(|row| {
+                            item.calendar_id
+                                .as_deref()
+                                .is_none_or(|calendar| row.CalendarID == calendar)
+                        })
+                        .collect();
                     if rows.is_empty() {
+                        return None;
+                    }
+                    // Older shims omitted calendar_id on tombstones. Never
+                    // guess which copy to delete when the UID spans calendars.
+                    if rows.iter().any(|row| row.CalendarID != rows[0].CalendarID) {
                         return None;
                     }
                     match exception_rid(&item.mkcal_uid) {
@@ -346,7 +361,11 @@ pub fn plan_sync(server: &[proton_api::CalendarEvent], local: &[LocalItem]) -> S
                             .map(|r| r.ID.clone()),
                         // Master (or unparsable suffix): one op, the batch
                         // assembler expands the whole UID series.
-                        None => rows.first().map(|r| r.ID.clone()),
+                        None => rows
+                            .iter()
+                            .find(|r| r.RecurrenceID.is_none_or(|rid| rid <= 0))
+                            .or_else(|| rows.first())
+                            .map(|r| r.ID.clone()),
                     }
                 });
                 match resolved {
@@ -634,10 +653,10 @@ mod tests {
     fn test_ids_for_uid_groups_series() {
         let rows = vec![row("e1", "u1", 1), row("e2", "u1", 2), row("e3", "u9", 3)];
         assert_eq!(
-            ids_for_uid(&rows, "u1"),
+            ids_for_uid(&rows, "", "u1"),
             vec!["e1".to_string(), "e2".to_string()]
         );
-        assert!(ids_for_uid(&rows, "missing").is_empty());
+        assert!(ids_for_uid(&rows, "", "missing").is_empty());
     }
 
     #[test]
@@ -702,6 +721,62 @@ mod tests {
         assert!(plan.uploads.is_empty());
         assert_eq!(plan.orphan_local_deletes, 1);
         assert_eq!(plan.purgeable_tombstones, vec!["n1".to_string()]);
+    }
+
+    #[test]
+    fn shared_and_invited_copies_keep_separate_update_and_delete_targets() {
+        let mut invited = row("invitation", "meeting", 100);
+        invited.CalendarID = "personal".into();
+        let mut shared = row("organizer", "meeting", 100);
+        shared.CalendarID = "shared".into();
+        let mut exception = exception_row("edited-occurrence", "meeting", 100, 200);
+        exception.CalendarID = "personal".into();
+        let server = vec![shared, invited, exception];
+
+        let update = plan_sync(
+            &server,
+            &[
+                local("personal-copy", Some("invitation"), false, true, Some(100)),
+                local("shared-copy", Some("organizer"), false, false, Some(100)),
+            ],
+        );
+        assert_eq!(
+            update.uploads,
+            vec![UploadOp::Update {
+                proton_id: "invitation".into(),
+                mkcal_uid: "personal-copy".into(),
+            }]
+        );
+
+        // A lost event-id map must still resolve in the owning notebook,
+        // even if the shared copy is listed first.
+        let mut deleted = tombstone_uid("personal-copy", "meeting");
+        deleted.calendar_id = Some("personal".into());
+        let plan = plan_sync(&server, &[deleted.clone()]);
+        assert_eq!(
+            plan.uploads,
+            vec![UploadOp::Delete {
+                proton_id: "invitation".into()
+            }]
+        );
+        let batch = assemble_delete_batch("member", &plan, &server).unwrap();
+        let ids: Vec<_> = batch
+            .Events
+            .iter()
+            .map(|op| op.ID.as_deref().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["invitation", "edited-occurrence"]);
+
+        // Standalone recurrence deletion must not delete either master.
+        deleted.mkcal_uid = "personal-copy#200".into();
+        let plan = plan_sync(&server, &[deleted]);
+        let batch = assemble_delete_batch("member", &plan, &server).unwrap();
+        assert_eq!(batch.Events.len(), 1);
+        assert_eq!(batch.Events[0].ID.as_deref(), Some("edited-occurrence"));
+
+        // Old inventories without calendar scope cannot choose a copy.
+        let plan = plan_sync(&server, &[tombstone_uid("legacy", "meeting")]);
+        assert!(plan.uploads.is_empty());
     }
 
     #[test]

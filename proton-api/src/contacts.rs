@@ -8,6 +8,7 @@ pub struct ContactsClient {
     base_url: String,
     access_token: String,
     uid: String,
+    pacer: crate::client::RequestPacer,
 }
 
 impl ContactsClient {
@@ -17,6 +18,7 @@ impl ContactsClient {
             base_url: API_BASE.to_string(),
             access_token,
             uid,
+            pacer: Default::default(),
         }
     }
 
@@ -26,6 +28,7 @@ impl ContactsClient {
             base_url,
             access_token,
             uid,
+            pacer: Default::default(),
         }
     }
 
@@ -56,6 +59,7 @@ impl ContactsClient {
 
     /// List contacts with pagination
     pub fn list(&self, page: u32, page_size: u32) -> Result<ContactsListResponse> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!("{}/contacts/v4", self.base_url))
@@ -73,19 +77,48 @@ impl ContactsClient {
         Ok(parsed)
     }
 
-    /// Get all contacts (auto-paginates, fetches full data for each)
+    /// Complete ID/metadata inventory plus paged encrypted-card export.
+    /// Export duplicates (one row per email) are deduped by contact ID.
     pub fn list_all(&self) -> Result<Vec<Contact>> {
         let mut summaries = Vec::new();
+        let mut ids = std::collections::HashSet::new();
         let page_size = 100;
         let mut page = 0;
+        let mut expected_total = None;
 
         loop {
             let resp = self.list(page, page_size)?;
-            let total = resp.Total as usize;
+            let total = usize::try_from(resp.Total).map_err(|_| ProtonError::Api {
+                code: 0,
+                message: "Invalid contact total".into(),
+            })?;
+            if expected_total
+                .replace(total)
+                .is_some_and(|old| old != total)
+            {
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Contact listing changed during download; retry later".into(),
+                });
+            }
             let contacts_len = resp.Contacts.len();
+            for contact in &resp.Contacts {
+                if contact.ID.is_empty() || !ids.insert(contact.ID.clone()) {
+                    return Err(ProtonError::Api {
+                        code: 0,
+                        message: "Invalid or repeated contact ID in listing".into(),
+                    });
+                }
+            }
             summaries.extend(resp.Contacts);
 
             if summaries.len() >= total {
+                if summaries.len() != total {
+                    return Err(ProtonError::Api {
+                        code: 0,
+                        message: "Contact listing exceeds reported total".into(),
+                    });
+                }
                 break;
             }
             if contacts_len == 0 {
@@ -100,37 +133,130 @@ impl ContactsClient {
         if summaries.is_empty() {
             return Ok(Vec::new());
         }
-        // Blocking HTTP is latency-bound. Share reqwest's connection pool
-        // across a small number of workers, independent of device CPU count.
-        // Preserve listing order and fail closed: a summary has no encrypted
-        // cards and must never replace a fully populated local contact.
-        const FETCH_WORKERS: usize = 4;
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = summaries
-                .chunks(summaries.len().div_ceil(FETCH_WORKERS))
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        chunk
-                            .iter()
-                            .map(|s| self.get(&s.ID))
-                            .collect::<Result<Vec<_>>>()
-                    })
-                })
-                .collect();
-            let mut full_contacts = Vec::with_capacity(summaries.len());
-            for worker in workers {
-                let contacts = worker.join().map_err(|_| ProtonError::Api {
-                    code: 0,
-                    message: "Contact download worker failed".into(),
-                })??;
-                full_contacts.extend(contacts);
+        let mut exported = std::collections::HashMap::<String, Contact>::new();
+        let mut stagnant_pages = 0;
+        for page in 0..1000 {
+            self.pacer.wait();
+            let response = self
+                .client
+                .get(format!("{}/contacts/v4/contacts/export", self.base_url))
+                .header("Authorization", self.auth_header())
+                .header("x-pm-uid", &self.uid)
+                .header("x-pm-appversion", APP_VERSION)
+                .query(&[("Page", page), ("PageSize", 50)])
+                .send()?;
+            // Only an explicitly unavailable route permits the older,
+            // paced single-contact fallback. Never retry 429/5xx failures
+            // as hundreds of individual requests.
+            if page == 0 && matches!(response.status().as_u16(), 404 | 501) {
+                return summaries
+                    .iter()
+                    .map(|summary| self.get(&summary.ID))
+                    .collect();
             }
-            Ok(full_contacts)
+            let value: serde_json::Value = Self::check_response(response, "export")?.json()?;
+            if value
+                .get("Code")
+                .and_then(|c| c.as_i64())
+                .is_some_and(|c| c != 1000)
+            {
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Contact export rejected".into(),
+                });
+            }
+            let rows = value
+                .get("Contacts")
+                .and_then(|c| c.as_array())
+                .ok_or_else(|| ProtonError::Api {
+                    code: 0,
+                    message: "Contact export is missing its Contacts array".into(),
+                })?;
+            let before = exported.len();
+            for row in rows {
+                let contact: Contact = serde_json::from_value(row.clone())?;
+                if !ids.contains(&contact.ID) {
+                    return Err(ProtonError::Api {
+                        code: 0,
+                        message: "Contact export differs from ID inventory; retry later".into(),
+                    });
+                }
+                if let Some(previous) = exported.get(&contact.ID) {
+                    if serde_json::to_value(&previous.Cards)?
+                        != serde_json::to_value(&contact.Cards)?
+                    {
+                        return Err(ProtonError::Api {
+                            code: 0,
+                            message: "Conflicting duplicate contact export rows".into(),
+                        });
+                    }
+                } else {
+                    exported.insert(contact.ID.clone(), contact);
+                }
+            }
+            if exported.len() == ids.len() {
+                // Some servers omit cards for a small subset. Targeted detail
+                // reads are bounded; a summary-only bulk response cannot
+                // quietly degrade back into a full per-contact download.
+                let missing_cards = exported.values().filter(|c| c.Cards.is_none()).count();
+                if missing_cards > 10 {
+                    return Err(ProtonError::Api {
+                        code: 0,
+                        message: "Bulk contact export omitted encrypted cards".into(),
+                    });
+                }
+                let mut contacts = Vec::with_capacity(summaries.len());
+                for mut summary in summaries {
+                    let mut full = exported.remove(&summary.ID).expect("complete ID set");
+                    if full.Cards.is_none() {
+                        full = self.get(&summary.ID)?;
+                    }
+                    if full.ID != summary.ID {
+                        return Err(ProtonError::Api {
+                            code: 0,
+                            message: "Contact detail ID mismatch".into(),
+                        });
+                    }
+                    // Export need not carry metadata. Keep the listing's
+                    // UID and modification anchors for upload planning.
+                    summary.Cards = full.Cards;
+                    if !full.UID.is_empty() {
+                        summary.UID = full.UID;
+                    }
+                    if full.ModifyTime > 0 {
+                        summary.ModifyTime = full.ModifyTime;
+                    }
+                    contacts.push(summary);
+                }
+                return Ok(contacts);
+            }
+            if rows.len() < 50 {
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Contact export ended before all listed IDs were downloaded".into(),
+                });
+            }
+            stagnant_pages = if exported.len() == before {
+                stagnant_pages + 1
+            } else {
+                0
+            };
+            if stagnant_pages >= 3 {
+                return Err(ProtonError::Api {
+                    code: 0,
+                    message: "Contact export pagination made no progress".into(),
+                });
+            }
+        }
+        Err(ProtonError::Api {
+            code: 0,
+            message: "Contact export pagination limit exceeded".into(),
         })
     }
 
     /// Get single contact by ID
     pub fn get(&self, contact_id: &str) -> Result<Contact> {
+        self.pacer.wait();
         let resp = self
             .client
             .get(format!("{}/contacts/v4/{}", self.base_url, contact_id))
@@ -143,6 +269,12 @@ impl ContactsClient {
         let parsed: serde_json::Value = serde_json::from_str(&text)?;
         let contact: Contact =
             serde_json::from_value(parsed["Contact"].clone()).map_err(ProtonError::Serde)?;
+        if contact.ID != contact_id {
+            return Err(ProtonError::Api {
+                code: 0,
+                message: "Contact detail ID mismatch".into(),
+            });
+        }
         Ok(contact)
     }
 
@@ -164,6 +296,7 @@ impl ContactsClient {
 
     /// Create contacts (batch)
     pub fn create(&self, req: CreateContactsRequest) -> Result<CreateContactsResponse> {
+        self.pacer.wait();
         let resp = Self::check_response(
             self.client
                 .post(format!("{}/contacts/v4", self.base_url))
@@ -180,6 +313,7 @@ impl ContactsClient {
 
     /// Update contact
     pub fn update(&self, contact_id: &str, req: UpdateContactRequest) -> Result<Contact> {
+        self.pacer.wait();
         let resp = Self::check_response(
             self.client
                 .put(format!("{}/contacts/v4/{}", self.base_url, contact_id))
@@ -202,6 +336,7 @@ impl ContactsClient {
     /// server explicitly reports one outside 1000/1001 — a bare `{}` stays
     /// success, matching go-proton-api's transport-only handling).
     pub fn delete(&self, ids: &[String]) -> Result<()> {
+        self.pacer.wait();
         #[allow(non_snake_case)]
         #[derive(Serialize)]
         struct DeleteReq {
@@ -270,6 +405,109 @@ pub fn generate_contact_uid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_export_deduplicates_across_pages_and_preserves_metadata() {
+        let mut server = mockito::Server::new();
+        let list = server.mock("GET", "/contacts/v4")
+            .match_query(mockito::Matcher::Any)
+            .with_body(r#"{"Total":2,"Contacts":[{"ID":"b","UID":"ub","ModifyTime":20},{"ID":"a","UID":"ua","ModifyTime":10}]}"#).create();
+        let card = serde_json::json!({"ID":"a","Cards":[{"Type":2,"Data":"card-a"}]});
+        let first = server
+            .mock("GET", "/contacts/v4/contacts/export")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("Page".into(), "0".into()),
+                mockito::Matcher::UrlEncoded("PageSize".into(), "50".into()),
+            ]))
+            .with_body(serde_json::json!({"Contacts":vec![card;50]}).to_string())
+            .create();
+        let second = server.mock("GET", "/contacts/v4/contacts/export")
+            .match_query(mockito::Matcher::UrlEncoded("Page".into(), "1".into()))
+            .with_body(r#"{"Contacts":[{"ID":"a","Cards":[{"Type":2,"Data":"card-a"}]},{"ID":"b","Cards":[{"Type":3,"Data":"card-b"}]}]}"#).create();
+        let individual = server
+            .mock("GET", mockito::Matcher::Regex("/contacts/v4/[ab]$".into()))
+            .expect(0)
+            .create();
+        let client = ContactsClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let contacts = client.list_all().unwrap();
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].UID, "ub");
+        assert_eq!(contacts[0].ModifyTime, 20);
+        assert_eq!(contacts[0].Cards.as_ref().unwrap()[0].Data, "card-b");
+        list.assert();
+        first.assert();
+        second.assert();
+        individual.assert();
+    }
+
+    #[test]
+    fn incomplete_or_rejected_export_never_falls_back_to_individual_requests() {
+        for (status, body) in [
+            (200, r#"{"Contacts":[]}"#),
+            (200, r#"{"Contacts":[{"ID":"other","Cards":[]}]}"#),
+            (200, r#"{}"#),
+            (429, r#"{"Code":429,"Error":"Too many requests"}"#),
+            (503, r#"{}"#),
+        ] {
+            let mut server = mockito::Server::new();
+            let _list = server
+                .mock("GET", "/contacts/v4")
+                .match_query(mockito::Matcher::Any)
+                .with_body(r#"{"Total":1,"Contacts":[{"ID":"a"}]}"#)
+                .create();
+            let export = server
+                .mock("GET", "/contacts/v4/contacts/export")
+                .match_query(mockito::Matcher::Any)
+                .with_status(status)
+                .with_body(body)
+                .create();
+            let detail = server.mock("GET", "/contacts/v4/a").expect(0).create();
+            let client = ContactsClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+            assert!(client.list_all().is_err(), "{status} {body}");
+            export.assert();
+            detail.assert();
+        }
+    }
+
+    #[test]
+    fn conflicting_export_cards_and_mass_missing_cards_abort_without_request_storm() {
+        for large in [false, true] {
+            let mut server = mockito::Server::new();
+            let inventory: Vec<_> = (0..if large { 11 } else { 1 })
+                .map(|i| serde_json::json!({"ID":format!("c{i}")}))
+                .collect();
+            let _list = server
+                .mock("GET", "/contacts/v4")
+                .match_query(mockito::Matcher::Any)
+                .with_body(
+                    serde_json::json!({"Total":inventory.len(),"Contacts":inventory}).to_string(),
+                )
+                .create();
+            let rows = if large {
+                inventory
+            } else {
+                vec![
+                    serde_json::json!({"ID":"c0","Cards":[{"Type":2,"Data":"first"}]}),
+                    serde_json::json!({"ID":"c0","Cards":[{"Type":2,"Data":"second"}]}),
+                ]
+            };
+            let _export = server
+                .mock("GET", "/contacts/v4/contacts/export")
+                .match_query(mockito::Matcher::Any)
+                .with_body(serde_json::json!({"Contacts":rows}).to_string())
+                .create();
+            let details = server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex("/contacts/v4/c[0-9]+$".into()),
+                )
+                .expect(0)
+                .create();
+            let client = ContactsClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+            assert!(client.list_all().is_err());
+            details.assert();
+        }
+    }
 
     #[test]
     fn test_list_all_fetches_full_contacts_in_listing_order() {

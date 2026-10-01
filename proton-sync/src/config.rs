@@ -37,6 +37,8 @@ pub struct SyncConfig {
     #[serde(default)]
     pub calendar_defaults: Option<HashMap<String, CalendarDefaults>>,
     #[serde(default)]
+    pub calendar_snapshot: Option<crate::calendar_cache::CalendarSnapshot>,
+    #[serde(default)]
     pub local_inventory: Option<Vec<crate::upsync::LocalItem>>,
     #[serde(default)]
     pub anchor_map: Option<HashMap<String, i64>>,

@@ -437,11 +437,10 @@ pub struct CalendarSettings {
 }
 
 impl CalendarSettings {
-    /// True when no usable defaults are present (v2 sends an empty `{}` on
-    /// some servers — treat exactly like absent so the v1 fill-in runs).
+    /// An absent defaults object needs a v1 fill-in; explicit empty arrays
+    /// are authoritative "no reminders", not missing settings.
     pub fn is_empty(&self) -> bool {
-        let empty = |v: &Option<Vec<serde_json::Value>>| v.as_ref().is_none_or(Vec::is_empty);
-        empty(&self.DefaultPartDayNotifications) && empty(&self.DefaultFullDayNotifications)
+        self.DefaultPartDayNotifications.is_none() && self.DefaultFullDayNotifications.is_none()
     }
 }
 

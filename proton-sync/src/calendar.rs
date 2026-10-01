@@ -83,6 +83,7 @@ pub struct CalendarSyncEngine {
     // retry idempotency. Read by the shim via `pending_json` on EVERY
     // outcome (complete clears it, error keeps it).
     last_pending: Arc<Mutex<HashMap<String, String>>>,
+    last_snapshot: Arc<Mutex<Option<crate::calendar_cache::CalendarSnapshot>>>,
 }
 
 impl CalendarSyncEngine {
@@ -112,6 +113,7 @@ impl CalendarSyncEngine {
             last_conflicts: Arc::new(Mutex::new(Vec::new())),
             last_anchors: Arc::new(Mutex::new(HashMap::new())),
             last_pending: Arc::new(Mutex::new(HashMap::new())),
+            last_snapshot: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -160,6 +162,17 @@ impl CalendarSyncEngine {
         serde_json::to_string(&*map).unwrap_or_default()
     }
 
+    pub fn snapshot_json(&self) -> String {
+        lock_or_recover(&self.last_snapshot)
+            .as_ref()
+            .and_then(|snapshot| serde_json::to_string(snapshot).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn restore_snapshot(&mut self, json: &str) {
+        lock_or_recover(&self.config).calendar_snapshot = serde_json::from_str(json).ok();
+    }
+
     fn calendar_client(config: &SyncConfig, access_token: &str, uid: &str) -> CalendarClient {
         match &config.api_base_url {
             Some(base) if !base.is_empty() => {
@@ -176,6 +189,7 @@ impl CalendarSyncEngine {
     pub fn start_sync(&mut self, config: SyncConfig) {
         *lock_or_recover(&self.config) = config.clone();
         *lock_or_recover(&self.events_json) = None;
+        *lock_or_recover(&self.last_snapshot) = None;
         self.set_status(SyncStatus {
             state: "syncing".into(),
             progress: 0.0,
@@ -242,9 +256,24 @@ impl CalendarSyncEngine {
         let mut out = Vec::new();
         let mut query_errors: Vec<String> = Vec::new();
         let mut fetched: Vec<(proton_api::Calendar, Vec<CalendarEvent>)> = Vec::new();
+        let now = chrono::Utc::now().timestamp();
+        let previous = config
+            .calendar_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.version == 1 && snapshot.owner == uid);
+        let mut snapshots = HashMap::new();
         for cal in &cals {
-            match cal_client.list_all_events(&cal.ID) {
-                Ok(evs) => {
+            let cached = previous.and_then(|snapshot| snapshot.calendars.get(&cal.ID));
+            match crate::calendar_cache::download(&cal_client, &cal.ID, cached, now) {
+                Ok(snapshot) => {
+                    let evs = snapshot.events.clone();
+                    self.set_debug(format!(
+                        "calendar_download cal={} cached={} rows={}",
+                        &cal.ID[..8.min(cal.ID.len())],
+                        cached.is_some(),
+                        evs.len()
+                    ));
+                    snapshots.insert(cal.ID.clone(), snapshot);
                     // Head-to-head listing diagnostic (env-gated, read-only,
                     // zero behavior change): the same ±45d window through
                     // the typed 4-Type sweep, compared as ID sets against
@@ -400,12 +429,10 @@ impl CalendarSyncEngine {
                     .DefaultFullDayNotifications
                     .as_deref()
                     .map_or_else(Vec::new, Self::parse_notification_list);
-                if !part.is_empty() || !full.is_empty() {
-                    lock_or_recover(&self.last_defaults).insert(
-                        cal.ID.clone(),
-                        crate::config::CalendarDefaults { part, full },
-                    );
-                }
+                lock_or_recover(&self.last_defaults).insert(
+                    cal.ID.clone(),
+                    crate::config::CalendarDefaults { part, full },
+                );
             }
             // Display metadata lives on the member entry (api.md drift),
             // top-level Name is a legacy fallback.
@@ -442,6 +469,9 @@ impl CalendarSyncEngine {
                 }
             ));
             for ev in events {
+                if !crate::calendar_cache::in_display_window(ev, now) {
+                    continue;
+                }
                 let cached = config
                     .calendar_defaults
                     .as_ref()
@@ -482,6 +512,16 @@ impl CalendarSyncEngine {
                 ));
             }
         }
+        for (calendar, events) in &fetched {
+            if let Some(snapshot) = snapshots.get_mut(&calendar.ID) {
+                snapshot.events = events.clone();
+            }
+        }
+        *lock_or_recover(&self.last_snapshot) = Some(crate::calendar_cache::CalendarSnapshot {
+            version: 1,
+            owner: uid,
+            calendars: snapshots,
+        });
         Ok(out)
     }
 
@@ -692,6 +732,13 @@ impl CalendarSyncEngine {
                 }
                 let pid = item.proton_id.clone();
                 for (cal, events) in fetched.iter_mut() {
+                    if item
+                        .calendar_id
+                        .as_deref()
+                        .is_some_and(|calendar| calendar != cal.ID)
+                    {
+                        continue;
+                    }
                     if let Some(pid) = pid.as_deref() {
                         if events.iter().any(|e| e.ID == pid) {
                             break;
@@ -712,7 +759,9 @@ impl CalendarSyncEngine {
                                 fresh.len()
                             ));
                             events.extend(fresh);
-                            break;
+                            // Legacy UID-only tombstones have no calendar
+                            // scope. Collect all copies so planning can reject
+                            // an ambiguous match instead of choosing the first.
                         }
                         _ => {}
                     }
@@ -1068,9 +1117,9 @@ impl CalendarSyncEngine {
             };
             let n = batch.Events.len();
             self.put_batch(cal_client, &cal.ID, &batch, "delete")?;
-            for op in &cal_plan.uploads {
-                if let crate::upsync::UploadOp::Delete { proton_id } = op {
-                    uploaded.insert(proton_id.clone());
+            for op in &batch.Events {
+                if let Some(id) = &op.ID {
+                    uploaded.insert(id.clone());
                 }
             }
             self.set_debug(format!(
@@ -1090,29 +1139,35 @@ impl CalendarSyncEngine {
             }
         }
         for cal_id in &relist {
-            let fresh =
-                cal_client
-                    .list_all_events(cal_id)
-                    .map_err(|e| proton_api::ProtonError::Api {
-                        code: 0,
-                        message: format!("upsync re-list failed: {e}"),
-                    })?;
+            let fresh = cal_client
+                .list_all_events_untyped(cal_id, i64::MIN, i64::MAX)
+                .map_err(|e| proton_api::ProtonError::Api {
+                    code: 0,
+                    message: format!("upsync re-list failed: {e}"),
+                })?;
             if let Some(entry) = fetched.iter_mut().find(|(cal, _)| &cal.ID == cal_id) {
                 entry.1 = fresh;
             }
         }
-        // Drain confirmed retry UIDs: a posted UID present anywhere in
-        // the reconciled listing is confirmed (drop it). Anything else
+        // Drain confirmed retry UIDs only in their destination calendar.
+        // A shared/invited copy elsewhere does not confirm this create.
+        // Anything else
         // stays pending — e.g. an out-of-window create the windowed
         // re-list cannot see yet retries with the SAME uid next cycle
         // (convergent when the server dedupes, never worse than a fresh
         // UID otherwise). Any re-list failure above aborts (Err) with the
         // whole map intact for the shim to persist.
-        let confirmed: std::collections::HashSet<&str> = fetched
+        let confirmed: std::collections::HashSet<(&str, &str)> = fetched
             .iter()
-            .flat_map(|(_, evs)| evs.iter().map(|e| e.UID.as_str()))
+            .flat_map(|(cal, evs)| evs.iter().map(|e| (cal.ID.as_str(), e.UID.as_str())))
             .collect();
-        lock_or_recover(&self.last_pending).retain(|_, uid| !confirmed.contains(uid.as_str()));
+        lock_or_recover(&self.last_pending).retain(|qid, uid| {
+            !inventory
+                .iter()
+                .find(|item| &item.mkcal_uid == qid)
+                .and_then(|item| item.calendar_id.as_deref())
+                .is_some_and(|calendar| confirmed.contains(&(calendar, uid.as_str())))
+        });
         Ok(())
     }
 
@@ -1677,7 +1732,10 @@ mod tests {
             DefaultPartDayNotifications: Some(vec![]),
             ..Default::default()
         };
-        assert!(empty_obj.is_empty());
+        assert!(
+            !empty_obj.is_empty(),
+            "explicit empty reminders are authoritative"
+        );
         let full = proton_api::CalendarSettings {
             DefaultPartDayNotifications: Some(
                 serde_json::from_str::<Vec<serde_json::Value>>(
@@ -2882,6 +2940,103 @@ mod tests {
         c.api_base_url = Some(server_url);
         c.local_inventory = Some(inventory);
         c
+    }
+
+    #[test]
+    fn uid_augment_deletes_only_the_owning_calendar_copy() {
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        let mat = make_key_material();
+        mock_bootstrap(&mut server, &mut guards, &mat);
+        let lookup = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+            )
+            .match_query(mockito::Matcher::UrlEncoded("UID".into(), "meeting".into()))
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Events":[{"ID":"invitation","UID":"meeting","CalendarID":"cal1"}],"More":0}"#,
+            )
+            .create();
+        let wrong_lookup = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/calendar/v1/shared/events.*".into()),
+            )
+            .expect(0)
+            .create();
+        let delete = server
+            .mock("PUT", "/calendar/v1/cal1/events/sync")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"MemberID":"m1","Events":[{"ID":"invitation"}]}"#.into(),
+            ))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1001,"Responses":[]}"#)
+            .create();
+        let inventory = vec![crate::upsync::LocalItem {
+            mkcal_uid: "personal-copy".into(),
+            deleted: true,
+            calendar_id: Some("cal1".into()),
+            uid: Some("meeting".into()),
+            ..Default::default()
+        }];
+        let config = phase_config(server.url(), inventory);
+        let engine = CalendarSyncEngine::new(config.clone());
+        let client = CalendarSyncEngine::calendar_client(&config, "at", "uid");
+        let mut shared = test_calendar();
+        shared.ID = "shared".into();
+        let organizer = CalendarEvent {
+            ID: "organizer".into(),
+            UID: "meeting".into(),
+            CalendarID: "shared".into(),
+            ..Default::default()
+        };
+        // Shared calendar first: the old unscoped lookup chose it first.
+        let mut fetched = vec![(shared, vec![organizer]), (test_calendar(), vec![])];
+        let mut keys = material_address_keys(&mat);
+        engine
+            .run_upload_phase(&config, &client, &mut keys, "uid", &mut fetched)
+            .unwrap();
+        lookup.assert();
+        wrong_lookup.assert();
+        delete.assert();
+        assert_eq!(fetched[0].1.len(), 1);
+        assert_eq!(fetched[0].1[0].ID, "organizer");
+        assert!(fetched[1].1.is_empty());
+    }
+
+    #[test]
+    fn pending_create_is_not_confirmed_by_a_shared_calendar_copy() {
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        let mat = make_key_material();
+        mock_bootstrap(&mut server, &mut guards, &mat);
+        let mut item = create_item(Some("meeting"));
+        item.fields = None; // Deferred, so no create request or re-list.
+        let config = phase_config(server.url(), vec![item]);
+        let engine = CalendarSyncEngine::new(config.clone());
+        lock_or_recover(&engine.last_pending).insert("n1".into(), "meeting".into());
+        let client = CalendarSyncEngine::calendar_client(&config, "at", "uid");
+        let mut shared = test_calendar();
+        shared.ID = "shared".into();
+        let organizer = CalendarEvent {
+            ID: "organizer".into(),
+            UID: "meeting".into(),
+            CalendarID: "shared".into(),
+            ..Default::default()
+        };
+        let mut fetched = vec![(shared, vec![organizer]), (test_calendar(), vec![])];
+        let mut keys = material_address_keys(&mat);
+        engine
+            .run_upload_phase(&config, &client, &mut keys, "uid", &mut fetched)
+            .unwrap();
+        assert_eq!(
+            lock_or_recover(&engine.last_pending)
+                .get("n1")
+                .map(String::as_str),
+            Some("meeting")
+        );
     }
 
     /// Bootstrap chain the create path needs (member ID + working

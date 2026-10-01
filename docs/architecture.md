@@ -114,7 +114,9 @@ Groups `[<accountId>]`, `[<Uid>]`, `[<username>]`:
   (`QContactId → msecs`), `contacts_photos` (`QContactId → avatar string`),
   `contacts_pending` (`QContactId → stable UID`).
 - Calendar: `proton_id_map`, `proton_anchors`, `proton_last_modified`,
-  `calendar_pending`, `calendar_defaults`.
+  `calendar_pending`, `calendar_defaults`, `calendar_snapshot` (complete
+  encrypted event rows and per-calendar model-event cursors; committed after
+  a successful phone calendar save).
 
 Merge precedence for derived passwords: `accountId < username < Uid <
 signond blob`.

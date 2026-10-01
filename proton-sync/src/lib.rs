@@ -12,3 +12,4 @@ pub mod upsync;
 pub use config::SyncConfig;
 pub use engine::SyncEngine;
 pub use status::SyncStatus;
+pub mod calendar_cache;

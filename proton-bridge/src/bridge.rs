@@ -648,6 +648,23 @@ pub extern "C" fn proton_calendar_create_engine_with_inventory(
         synced_events_json: Arc::new(Mutex::new(None)),
     }))
 }
+/// Restore an encrypted snapshot before start_sync. Invalid input is ignored,
+/// forcing a full refresh rather than applying a partial cache.
+#[no_mangle]
+pub extern "C" fn proton_calendar_restore_snapshot(
+    e: *mut ProtonCalendarEngine,
+    json: *const c_char,
+) {
+    if e.is_null() {
+        return;
+    }
+    let json = unsafe { cstr_to_string(json) };
+    let eref = unsafe { &*e };
+    if let Some(engine) = lock_or_recover(&eref.inner).as_mut() {
+        engine.restore_snapshot(&json);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn proton_calendar_destroy_engine(e: *mut ProtonCalendarEngine) {
     if !e.is_null() {
@@ -819,6 +836,12 @@ fn calendar_engine_json(
 #[no_mangle]
 pub extern "C" fn proton_calendar_get_purgeable_json(e: *mut ProtonCalendarEngine) -> *mut c_char {
     calendar_engine_json(e, CalendarSyncEngine::purgeable_json)
+}
+
+/// Commit only after the matching phone calendar save succeeds.
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_snapshot_json(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    calendar_engine_json(e, CalendarSyncEngine::snapshot_json)
 }
 
 /// Server-wins conflicts this run (shim notifies; download overwrote them).
