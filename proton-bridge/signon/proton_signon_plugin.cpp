@@ -238,10 +238,12 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
         proton_auth_free_result(&authResult);
         qWarning() << "ProtonSignonPlugin: token refresh failed:" << err;
 
-        // Fall back to full login only when we actually have a password.
-        if (password.isEmpty()) {
+        // The identity Secret is normally the dummy "x", not the login
+        // password. Never attempt SRP with it after a refresh failure: that
+        // produces misleading CAPTCHA challenges and unnecessary logins.
+        if (password.isEmpty() || password == QStringLiteral("x")) {
             emit error(SignOn::Error(SignOn::Error::NotAuthorized,
-                                     QStringLiteral("Session expired, please sign in again")));
+                                     QStringLiteral("Session refresh failed: ") + err));
             return;
         }
     }

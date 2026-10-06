@@ -251,6 +251,13 @@ void ProtonContactsPlugin::onSignOnResponse(const SignOn::SessionData &data)
 {
     proton_log(QStringLiteral("onSignOnResponse()"));
 
+    if (data.getProperty(QStringLiteral("CaptchaRequired")).toBool()) {
+        QString err = QStringLiteral("Proton human verification required – please update credentials in Settings → Proton");
+        proton_log(err);
+        emit error(getProfileName(), err, Buteo::SyncResults::AUTHENTICATION_FAILURE);
+        return;
+    }
+
     // Detect locked 2FA session returned via custom TwoFARequired flag (QML OTP flow)
     // or missing scopes. The sync plugin runs with NoUserInteractionPolicy, so it
     // cannot prompt for OTP – the user must update credentials via Settings.
@@ -1372,6 +1379,12 @@ bool ProtonCalendarPlugin::requestCalendarCredentials() {
     return true;
 }
 void ProtonCalendarPlugin::onCalendarSignOnResponse(const SignOn::SessionData &data) {
+    if (data.getProperty(QStringLiteral("CaptchaRequired")).toBool()) {
+        QString err = QStringLiteral("Proton human verification required – please update credentials in Settings → Proton");
+        proton_log(err);
+        emit error(getProfileName(), err, Buteo::SyncResults::AUTHENTICATION_FAILURE);
+        return;
+    }
     bool twoFARequired = data.getProperty(QStringLiteral("TwoFARequired")).toBool();
     if (twoFARequired) {
         emit error(getProfileName(), QStringLiteral("Two-factor authentication required – please update credentials in Settings → Proton and enter OTP code"), Buteo::SyncResults::AUTHENTICATION_FAILURE);
