@@ -7,10 +7,13 @@ Contacts and Calendar.
 proton-api/       Pure Rust: Proton REST client (SRP auth, 2FA, contacts,
                   calendar, PGP, key salts)
 proton-sync/      Pure Rust: sync engines (contacts SyncEngine, calendar
-                  CalendarSyncEngine) + QSettings-derived cache handling
-proton-bridge/    Rust FFI + C++: SignOn auth plugin (libprotonplugin.so)
-                  + Buteo OOPP plugin (libproton-client.so, QContactManager
-                  + mKCal/KCalendarCore notebooks) + settings QML extension
+                  CalendarSyncEngine) + device/: every phone-side decision
+                  (inventories, reconcile write plans, bookkeeping,
+                  credentials merge, the session state machine)
+proton-bridge/    Rust FFI + thin C++ adapters: SignOn auth plugin
+                  (libprotonplugin.so), Buteo OOPP plugin
+                  (libproton-client.so: QContactManager + mKCal I/O only)
+                  + settings QML extension
 ui/               QML AccountCreationAgent / AccountCredentialsAgent /
                   OnlineSyncAccountSettingsAgent
 buteo-profiles/   Buteo client/sync profile templates
@@ -32,9 +35,31 @@ tools/            build-qm.sh, apply-translations.py
   `qobject_cast<SyncPluginLoader*>` (`Q_PLUGIN_METADATA(IID
   "com.buteo.msyncd.SyncPluginLoader/1.0")`).
 - `createClientPlugin` dispatches on the profile name: names containing
-  `caldav`, `calendar` or `Calendar` create `ProtonCalendarPlugin`,
-  everything else creates `ProtonContactsPlugin`
+  `caldav`, `calendar` or `Calendar` create a calendar `ProtonSyncPlugin`,
+  everything else a contacts one
   (`proton-bridge/cxx/proton_bridge_shim.cpp`).
+
+## Shim / Rust split
+
+The C++ shim is an I/O adapter. All sync logic is in
+`proton-sync/src/device/` and runs as a `Session` state machine behind
+three FFI calls (`proton_sync_new(kind, accountId)`,
+`proton_sync_step(sync, json)`, `proton_sync_free`). Each step returns an
+outcome `{settings?, log?, notices?, request?, result?}`; the shim applies
+the settings patch (per key, `proton_settings.h`), writes the log lines,
+shows the notices, then answers the request:
+
+| Request | Shim action | Answer |
+|---|---|---|
+| `local` | dump our contacts collection / notebooks as raw JSON | `{"local": {ok, data}}` |
+| `avatars` | read avatar files, scale to 512px JPEG data URIs | `{"avatars": {data}}` |
+| `poll` | wait `after_ms` (engine runs on a Rust thread) | `{"poll": {}}` |
+| `write` | execute the write plan (refs index the last dump) | `{"written": {ok, data}}` |
+
+A `result` (`{ok, message, auth_failure}`) ends the run with Buteo
+`success` or `error` (`AUTHENTICATION_FAILURE` / `INTERNAL_ERROR`). The
+run starts with `{"begin": {credentials: <SignOn session map>, settings:
+<every QSettings group>}}`.
 - Client profile `proton` (`buteo-profiles/client/proton-contacts.xml`);
   sync profiles `proton-carddav` (`buteo-profiles/sync/proton.Contacts.xml`)
   and `proton-caldav` (`buteo-profiles/sync/proton.Calendar.xml`), both
@@ -75,7 +100,7 @@ tools/            build-qm.sh, apply-translations.py
   `enabled=false hidden=true` (overridden per account). Auth runs in
   `startSync()`, not `init()`.
 - Stock credential flow (CardDAV `auth.cpp` pattern, mirrored by the
-  shim): load `Accounts::Account` by ID → pick the service →
+  shim; the response map is handed to Rust as-is): load `Accounts::Account` by ID → pick the service →
   `AccountService` → `credentialsId` → `SignOn::Identity` → session →
   `process(sessionData, mechanism)` → username/token response.
 
@@ -112,9 +137,11 @@ Groups `[<accountId>]`, `[<Uid>]`, `[<username>]`:
 - Contacts: `contacts_id_map` (`Proton UID → QContactId`), `contacts_anchors`
   (`Proton UID → server ModifyTime`), `contacts_last_modified`
   (`QContactId → msecs`), `contacts_photos` (`QContactId → avatar string`),
-  `contacts_pending` (`QContactId → stable UID`).
+  `contacts_pending` (`QContactId → stable UID`), `contacts_row_hashes`
+  (`Proton UID → fingerprint of the last written server row`).
 - Calendar: `proton_id_map`, `proton_anchors`, `proton_last_modified`,
-  `calendar_pending`, `calendar_defaults`, `calendar_snapshot` (complete
+  `calendar_pending`, `calendar_defaults`, `calendar_row_hashes` (`series
+  UID → fingerprint of the last written server rows`), `calendar_snapshot` (complete
   encrypted event rows and per-calendar model-event cursors; committed after
   a successful phone calendar save).
 
@@ -124,8 +151,8 @@ signond blob`.
 ## Diagnostics
 
 - `PROTON_VERBOSE` (non-empty, not `"0"`): verbose logging in Rust
-  (`proton-api/src/diag.rs` `verbose()` + `vlog!`) and in the shim
-  (`proton_verbose()` / `proton_log_verbose()`). The oopp-runner inherits
+  (`proton-api/src/diag.rs` `verbose()` + `vlog!`; the device session
+  emits its verbose lines through the shim's file log). The oopp-runner inherits
   msyncd's environment at msyncd start, so toggling requires
   `systemctl --user set-environment PROTON_VERBOSE=1` (or
   `unset-environment`) **plus** `systemctl --user restart msyncd`. No root

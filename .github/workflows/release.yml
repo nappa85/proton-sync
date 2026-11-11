@@ -20,7 +20,7 @@ concurrency:
 jobs:
   build:
     name: Build RPMs in Sailfish SDK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Checkout

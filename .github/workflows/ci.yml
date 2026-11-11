@@ -12,7 +12,7 @@ concurrency:
 jobs:
   rust:
     name: Rust workspace (fmt, clippy, test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: .
@@ -34,22 +34,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
-  calendar-identity:
-    name: Calendar identity regression (Qt)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Qt Core headers
-        run: sudo apt-get update && sudo apt-get install -y qtbase5-dev
-      - name: Verify shared-calendar identities and legacy migration
-        run: |
-          g++ -std=c++14 -fPIC proton-bridge/cxx/tests/calendar_identity_test.cpp \
-            $(pkg-config --cflags --libs Qt5Core) -o /tmp/calendar-identity-test
-          /tmp/calendar-identity-test
-
   qml:
     name: QML lint (qmllint syntax)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Qt QML tools
@@ -67,7 +54,7 @@ jobs:
 
   i18n:
     name: Translations freshness (lupdate/lrelease)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -82,7 +69,7 @@ jobs:
   # Cross-compilation test for aarch64 (host-only, no SDK) — needs aarch64 gcc for ring
   rust-cross:
     name: Rust cross-compile check (aarch64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: .

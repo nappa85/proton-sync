@@ -85,6 +85,8 @@ fields?: ParsedContact, pending_uid?}`.
   server, clean → applied as server delete by the download.
 - Deletes held (deferred one cycle) while guid-less or server-unknown rows
   exist. An edit that loses its Guid duplicates instead of deleting.
+- Deletes are also held when the local collection is empty but the ID map
+  is not: that is a lost local write, never "delete everything" on Proton.
 
 Execution:
 
@@ -103,56 +105,72 @@ Execution:
 
 `ContactUploadOutcome{contacts, conflicts, anchors, trace,
 pending_creates: {qcontact_id: uid}, deferred: Vec<ContactDeferred{kind:
-create|update, id, reason}>}`. `pending_creates` is exposed after every
-outcome (error keeps, complete clears) and fed back as `pending_uid`.
+create|update, id, reason}>, confirmed_creates: {qcontact_id: uid}}`.
+`pending_creates` is exposed after every outcome (error keeps, complete
+keeps only UIDs the re-list did not show) and fed back as `pending_uid`.
+`confirmed_creates` (re-listed or adopted creates) is exposed via
+`get_contact_confirmed_json`. Download rows carry `mtime`
+(server `ModifyTime`) and `decrypt_failed`.
 Anchors persist wholesale; empty anchors never clobber the cache.
 
-## Sync FFI (`proton-bridge/src/bridge.rs`)
+## Engine outputs and the device session
 
-- In: `proton_bridge_create_engine_with_inventory(username, password,
-  access_token, refresh_token, uid, totp, derived_json, inventory_json,
-  known_uids_json, anchors_json)`. Empty/invalid JSON degrades to `None`
-  (download-only), never half-fed. Lifecycle: `create*` →
-  `proton_bridge_start_sync` → getters → `proton_bridge_destroy_engine`.
-  Status via `proton_bridge_get_status` (16-byte buffer; `needs_2fa` passes
-  through and stops the poll with an authentication-failure notification).
-- Out (`char*`, free with `proton_bridge_free_string`):
-  - `…_get_synced_contacts_json` → `ProcessedContact[]` (full field mirror;
-    photos omitted from inventory uploads v1 except avatar handling below).
-  - `…_get_contact_conflicts_json` → `ContactConflict[]`.
-  - `…_get_contact_deferred_json` → `ContactDeferred[]` (IDs + codes only;
-    also appended to the sync notification and the file log).
-  - `…_get_contact_anchors_json` → `{uid: mtime}` or null.
-  - `…_get_contact_pending_json` → `{qcontact_id: uid}` or null.
-  - `…_get_refresh_token`, `…_get_uid`, `…_get_derived_passwords_json`,
-    `…_get_keys_debug` (carries the `contact_upsync` trace:
-    inputs/plan/ran/defer-reasons/hold markers).
+The engine is driven by `proton-sync/src/device/session.rs` (see
+architecture.md, "Shim / Rust split"); no per-field FFI getters remain.
+Inputs come from settings + the shim's raw dump: `contact_inventory`,
+`contact_known_uids` (`contacts_id_map` keys) and `contact_anchors`
+(only when persisted). An unreadable local store degrades to
+download-only (`None`), never to a half-fed plan. After the run the
+session reads `ProcessedContact[]`, conflicts, deferred uploads (IDs +
+reason codes: notification + file log), anchors, pending and confirmed
+creates, tokens, derived passwords and the `keys_debug` trace
+(`contact_upsync` inputs/plan/ran/defer-reasons/hold markers). `needs_2fa`
+ends the run with an authentication failure and a verification notice.
 
-## Shim mapping (`proton_bridge_shim.cpp`, contacts parts)
+## Phone side (`proton-sync/src/device/contacts.rs`)
 
-- One `QContactCollection` per account (`remote_uid=proton-contacts-<id>`),
-  full-replacement write, `QContactSyncTarget=proton`, `QContactGuid` =
-  Proton UID.
-- Field map: name → `QContactName`, display label (+ split fallback),
-  emails (Home/Work contexts), phones (cell/mobile/fax/pager/voice/video/car
-  subtypes + Home/Work), addresses, organization/title/role, notes
-  (newline-joined), birthday/anniversary, nickname, URL, gender
-  (Male/Female round-trip), first photo → `QContactAvatar`. Last avatar
-  detail wins.
-- `exportContactsInventory`: every row exports identity flags
-  (`qcontact_id`, `proton_uid|null`, `modified` from `contacts_last_modified`
-  vs `lastModified`, `last_synced_mtime` from `contacts_anchors`,
+The shim dumps every contact of the account collection
+(`remote_uid=proton-contacts-<id>`, `QContactSyncTarget=proton`,
+`QContactGuid` = Proton UID) as raw details (`id, guid, last_modified,
+names, emails/phones/addresses with context and sub-type names,
+organization, notes, birthday, anniversary, nickname, url, gender,
+avatars[]`) and saves/removes what the write plan says. Everything else is
+Rust:
+
+- Inventory: every row exports identity flags (`qcontact_id`,
+  `proton_uid|null`, `modified` from `contacts_last_modified` vs
+  `last_modified`, `last_synced_mtime` from `contacts_anchors`,
   `pending_uid` for guid-less rows); dirty/never-synced rows additionally
-  export `fields`.
-- Photos: `data:` URIs pass through; file paths load and downscale to a
-  512px JPEG q85 data URI (QtGui built-in). The avatar is exported only when
-  it differs from the persisted download baseline (`contacts_photos`, read
-  back post-save for like-for-like comparison); conversion failures omit
-  (server copy wins). Known row whose avatar is gone while the baseline has
-  one exports `photo_removed: true` (never for guid-less rows).
+  export `fields` (phone types `cell,fax,pager,voice,video,car` then
+  `home,work`; gender `Male`/`Female`).
+- Photos: `data:` URIs pass through; other avatars are requested from the
+  shim (`avatars` request: file → 512px JPEG q85 data URI). The avatar is
+  exported only when it differs from the persisted download baseline
+  (`contacts_photos`, read back post-save for like-for-like comparison);
+  conversion failures omit (server copy wins). A known row whose avatar is
+  gone while the baseline has one exports `photo_removed: true` (never for
+  guid-less rows). Last avatar detail wins.
+- Reconciling write (`device/reconcile.rs`): rows match by Guid; each
+  server row is fingerprinted (SHA-256 of canonical JSON minus
+  `keys_debug`, persisted as `contacts_row_hashes`). Unchanged rows are
+  left untouched (pending local edits survive; their
+  `contacts_last_modified` and `contacts_photos` baselines carry over),
+  changed rows are rewritten in place (same `QContactId`), new rows added,
+  Guid'd rows the server no longer has removed, local duplicates of one
+  Guid dropped. Guid-less rows (phone-created, not uploaded yet) are kept;
+  a confirmed create's server row is merged into the same local contact.
+  `decrypt_failed` rows never overwrite an existing local copy. The shim
+  saves before it removes, so a failed save leaves the collection intact.
+  Confirmed creates stay in `contacts_pending` until the write succeeds.
+- Field map (server row → phone): name (display-name split fallback),
+  display label, emails (home/work), phones (cell/mobile/fax/pager/voice/
+  video/car + home/work), addresses, organization/title/role, notes
+  (newline-joined), birthday/anniversary (`YYYY-MM-DD` or `YYYYMMDD`),
+  nickname, URL, gender (`Female` → female, any other value → male), first
+  photo → avatar.
 - Notifications name conflict counts (`N contacts changed on both sides;
   server version kept`) and deferred counts (`N local changes could not be
-  uploaded; server version kept`).
+  uploaded yet; kept on the phone, retrying next sync`).
 
 ## References
 

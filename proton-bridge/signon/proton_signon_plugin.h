@@ -3,6 +3,10 @@
 #include <SignOn/authpluginif.h>
 #include "proton_bridge.h"
 
+// SignOn authentication plugin (method "proton", mechanism "password").
+// The login / refresh / 2FA / human-verification flow lives in Rust
+// (proton-bridge/src/auth.rs); this class forwards the session map and
+// emits what comes back.
 class ProtonSignonPlugin : public AuthPluginInterface
 {
     Q_OBJECT
@@ -20,7 +24,5 @@ public:
     void refresh(const SignOn::UiSessionData &data) override;
 
 private:
-    void handleAuthOk(ProtonAuthResult &authResult,
-                      const QString &username,
-                      const QString &password);
+    void run(const QString &mode, const SignOn::SessionData &data);
 };

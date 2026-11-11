@@ -77,16 +77,20 @@ at Verify time. The signond secret column stays the dummy `"x"`.
 
 ## SignOn plugin contract (`type="proton"`, `mechanisms=["password"]`)
 
-`proton-bridge/signon/proton_signon_plugin.cpp:process` inputs: `UserName`,
-`Secret` (dummy fallback), transient `Password` (preferred when present),
-`RefreshToken`, `Uid`, `AccessToken` (possibly locked), `TwoFactorPassword`
-(trimmed). Branch order:
+The C++ plugin (`proton-bridge/signon/proton_signon_plugin.cpp`) only
+forwards the session map to `proton_signon_process` and emits what comes
+back; the flow lives in `proton-bridge/src/auth.rs` (`process`/`refresh`,
+unit-tested against a fake auth client). Inputs: `UserName`, `Secret`
+(dummy fallback), transient `Password` (preferred when present),
+`RefreshToken`, `Uid`, `AccessToken` (possibly locked),
+`TwoFactorPassword` (trimmed), `HumanVerificationToken`. Branch order:
 
-1. TOTP + refresh + UID + locked access token → `proton_auth_submit_2fa`.
-2. No fresh password + refresh + UID → `proton_auth_refresh`.
-3. Otherwise full `proton_auth_login`.
+1. TOTP + refresh + UID + locked access token → 2FA submit.
+2. No fresh password + refresh + UID → refresh (a failure with the dummy
+   secret stops here: no SRP with `"x"`).
+3. Otherwise full SRP login.
 
-`handleAuthOk` derives passwords, writes `derived_passwords` to
+On success it derives passwords, writes `derived_passwords` to
 `QSettings("proton","sync-tokens")` groups `[Uid]`/`[username]`, and emits
 `store()` with `{UserName, AccessToken, RefreshToken, Uid,
 DerivedPasswords}` plus `result()` with the same map (never `Secret` or
@@ -114,11 +118,13 @@ stored); otherwise `NotAuthorized`/`MissingData`.
 
 ## Auth FFI (`proton-bridge/src/auth.rs`)
 
-`ProtonAuthResult{status, access_token, refresh_token, uid, error,
-captcha_url, captcha_methods}` with `status`: 0 ok, 1 needs-2fa, 2 error,
-3 captcha. Functions: `proton_auth_login`, `proton_auth_submit_2fa`,
-`proton_auth_refresh`, `proton_derive_passwords` (JSON map or null),
-`proton_auth_free_string`, `proton_auth_free_result`.
+`char *proton_signon_process(const char *input_json)` with input
+`{"mode": "process"|"refresh", "data": {session map}}`; output
+`{store?, result?, error?: {code: "not_authorized"|"missing_data",
+message}, settings?: {group: {key: value}}, log?: [..]}` (free with
+`proton_string_free`). The plugin applies `settings` to
+`QSettings("proton","sync-tokens")`, emits `store` then `error` or
+`result`.
 
 ## References
 

@@ -156,7 +156,7 @@ upload phase (fail-closed) → per-calendar bootstrap → unlock calendar keys
 
 Calendar-list errors, any calendar query error, skipped/unparseable event
 rows, and event decryption/merge failures abort the download snapshot. The
-shim only applies a complete result, so a failed calendar cannot disappear
+session only writes a complete result, so a failed calendar cannot disappear
 from an otherwise successful account-wide replacement.
 
 `CalEventJson`: `id, uid, calendar_id, calendar_name, summary,
@@ -178,47 +178,72 @@ gone-everywhere rows (unlisted-by-window ≠ deleted). `SyncConfig`
 carries `local_inventory`, `anchor_map`, `calendar_defaults`; getters
 expose `defaults/purgeable/conflicts/anchors/pending` (`""` = no clobber).
 
-## Shim mapping (`proton_bridge_shim.cpp`, calendar parts)
+## Phone side (`proton-sync/src/device/calendar.rs`)
 
-- One mKCal notebook per Proton calendar
-  (`proton-calendar-<accountId>-<calendarId>`, legacy single notebook
-  retired); stored UID `proton-cal-<accountId>-<base64url(calendarId)>:<base64url(raw)>`
-  (mKCal enforces storage-wide uniqueness); exceptions append `#<rid>`.
-  Calendar scoping lets invitation and shared-calendar copies coexist with
-  the same wire UID. Raw UID is also stored in `X-PROTON-ICAL-UID`; old
-  account-only identities remain upload inputs until successful replacement.
-  Proton row ID is stored in `X-PROTON-EVENT-ID` (id-map fallback).
-- `fillEventFromJson`: summary (empty → UID), description, location, all-day
-  (exclusive-end adjusted), start/end (iCal or unix fallback, event timezone
-  attached), recurrence (`FREQ/INTERVAL/COUNT/UNTIL/BYDAY/BYMONTHDAY/BYMONTH/
-  BYYEARDAY/BYWEEKNO/BYSETPOS/WKST`; raw RRULE also stored), timezone-aware
-  `EXDATE`s, attendees (`attendees_full` → `Attendee` + organizer `Person`,
-  legacy email lists as fallback), status/transparency, color, alarms
-  (display + email start-offsets; `null` inherits calendar defaults, `[]`
-  stays reminder-free).
-- `exportLocalInventory`: live rows + tombstones with field data only for
+The shim dumps our notebooks (`proton-calendar-<accountId>` and
+`proton-calendar-<accountId>-*`) and every incidence in them, tombstones
+included, as raw fields (`notebook, uid, deleted, recurrence_id,
+last_modified, event_id, ical_uid, summary, description, location,
+start/end (unix), all_day, recurs, rule{freq, interval, count, until,
+by_day, by_month_day, by_month, by_set_pos, wkst, unsupported_parts},
+alarms (start offsets), color`), then executes the write plan. Everything
+else is Rust:
+
+- Identity (`device/calendar_identity.rs`): one notebook per Proton
+  calendar (`proton-calendar-<accountId>-<calendarId>`, legacy single
+  notebook retired); stored UID
+  `proton-cal-<accountId>-<base64url(calendarId)>:<base64url(raw)>` (mKCal
+  enforces storage-wide uniqueness); exceptions append `#<rid>`. Calendar
+  scoping lets invitation and shared-calendar copies coexist with the same
+  wire UID. Raw UID is also stored in `X-PROTON-ICAL-UID`; old
+  account-only identities remain upload inputs until successful
+  replacement. Proton row ID is stored in `X-PROTON-EVENT-ID` (id-map
+  fallback).
+- Inventory: live rows + tombstones with field data only for
   dirty/never-synced rows (common-subset RRULE serializer; unserializable
-  phone rules keep the server rule on update / defer creates);
-  notification/color/uid exported for the personal-route router.
-- `writeEventsToMkCal`: full replacement per notebook (masters first, then
-  exceptions as master `EXDATE` + standalone edited event — the framework
-  exception machinery does not persist dissociated rows); tombstone purge
-  scoped to our notebooks; maps persisted after every save. Empty/duplicate
-  identities within one calendar and notebook/load/add failures abort before
-  saving the replacement. UID-based tombstone lookup and series deletes are
-  scoped to the owning calendar; standalone exception deletes affect only
-  that occurrence.
-   Replacement deletions use `save(PurgeDeleted)` so they never become
-   uploadable user tombstones, including after an interrupted sync. Previously
-   persisted tombstones are purged selectively (planner set ∪ replacement
-   removals). Legacy notebook retirement happens after the replacement saves.
-- Calendar FFI mirrors contacts (`proton_calendar_create_engine_with_inventory`,
-  `…_with_derived_and_defaults`, `…_get_events_json`,
-  `…_get_{purgeable,conflicts,anchors,pending,defaults}_json`,
-   `…_get_refresh_token/uid/keys_debug`).
-  `proton_calendar_restore_snapshot` supplies the saved encrypted snapshot;
-  `…_get_snapshot_json` supplies its replacement after a complete cycle.
-  Rotated refresh tokens are also persisted when a later download fails.
+  phone rules keep the server rule on update / defer creates; alarms as
+  ISO8601 triggers); tombstones shadowing a live row are dropped.
+- Event spec (server row → phone, `device/caltime.rs` for times): summary
+  (empty → UID), description, location, all-day (exclusive-end adjusted),
+  start/end (iCal or unix fallback; floating times carry the event
+  timezone, the shim attaches it if the phone knows the zone), recurrence
+  (`FREQ/INTERVAL/COUNT/UNTIL/BYDAY/BYMONTHDAY/BYMONTH/BYYEARDAY/BYWEEKNO/
+  BYSETPOS/WKST`; raw RRULE also stored), timezone-aware `EXDATE`s,
+  attendees (`attendees_full`, legacy email lists as fallback, `mailto:`
+  stripped) + organizer, status/transparency, color, alarms (display +
+  email start-offsets; `null` inherits calendar defaults, `[]` stays
+  reminder-free).
+- Reconciling write (`device/reconcile.rs`). Server rows are grouped per
+  series (namespaced master UID + standalone exception rows) and
+  fingerprinted (SHA-256 of the canonical row JSON, persisted as
+  `calendar_row_hashes`). Local events of our notebooks are grouped the
+  same way:
+  - new series → added; unchanged fingerprint with an intact local copy
+    (right notebook, same number of parts, no phone-made recurrence-id
+    exception) → left untouched, so a local edit that has not uploaded yet
+    survives and stays dirty (its `proton_last_modified` baseline is carried
+    over); changed or altered → the series is deleted and re-added;
+  - synced series (stored-UID prefix, `X-PROTON-EVENT-ID` or id-map entry)
+    the server no longer lists → removed; events created on the phone and
+    not uploaded yet → kept. Creates confirmed this cycle (engine
+    `confirmed_json`, `{phone UID: wire UID}`) count as synced, so their
+    phone copy gives way to the server row.
+  Exceptions are written as a master `EXDATE` + standalone edited event
+  (the framework exception machinery does not persist dissociated rows).
+  Empty/duplicate identities abort before anything is touched.
+- Write plan, executed by the shim in order: delete (exceptions before
+  their master), ensure notebooks, add, `save(PurgeDeleted)` (deletions
+  never become uploadable user tombstones), retire the legacy notebook,
+  report `lastModified` of written rows, purge tombstones selectively
+  (planner set ∪ rows deleted here ∪ tombstones shadowing a live server
+  row; the legacy notebook wholesale). Any failure before the save leaves
+  the store untouched.
+- After a successful write the session persists `proton_id_map`,
+  `proton_anchors`, `proton_last_modified`, `calendar_row_hashes`,
+  `calendar_pending` (confirmed creates stay there until the write
+  succeeds, so a failed write retries under the same UID and adopts) and
+  the encrypted `calendar_snapshot`. Rotated refresh tokens are also
+  persisted when a download fails.
 
 ## References
 

@@ -34,7 +34,12 @@ struct ProcessedContact {
     gender: String,
     photos: Vec<String>,
     keys_debug: String,
-    #[serde(skip_serializing)]
+    /// Server `ModifyTime`: part of the row content the shim fingerprints,
+    /// so any server-side change (including our own upload) rewrites it.
+    mtime: i64,
+    /// Every encrypted card failed to decrypt: the row only carries the
+    /// signed side (name/emails). The shim keeps an existing local copy
+    /// instead of overwriting it with this partial view.
     decrypt_failed: bool,
 }
 
@@ -76,6 +81,7 @@ pub struct SyncEngine {
     contact_anchors: Arc<Mutex<std::collections::HashMap<String, i64>>>,
     contact_pending: Arc<Mutex<std::collections::HashMap<String, String>>>,
     contact_deferred: Arc<Mutex<Vec<ContactDeferred>>>,
+    contact_confirmed: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl SyncEngine {
@@ -111,6 +117,7 @@ impl SyncEngine {
             contact_anchors: Arc::new(Mutex::new(std::collections::HashMap::new())),
             contact_pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
             contact_deferred: Arc::new(Mutex::new(Vec::new())),
+            contact_confirmed: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -214,6 +221,8 @@ impl SyncEngine {
                     Ok(outcome) => {
                         *lock_or_recover(&self.contact_pending) = outcome.pending_creates.clone();
                         *lock_or_recover(&self.contact_deferred) = outcome.deferred_list.clone();
+                        *lock_or_recover(&self.contact_confirmed) =
+                            outcome.confirmed_creates.clone();
                         outcome
                     }
                     Err(e) => {
@@ -276,6 +285,7 @@ impl SyncEngine {
                             gender: String::new(),
                             photos: Vec::new(),
                             keys_debug: keys_debug.clone(),
+                            mtime: c.ModifyTime,
                             decrypt_failed: false,
                         };
 
@@ -871,6 +881,11 @@ pub struct ContactUploadOutcome {
     pub pending_creates: std::collections::HashMap<String, String>,
     /// Skipped uploads this cycle, for the user-visible deferred list.
     pub deferred_list: Vec<ContactDeferred>,
+    /// Phone-only rows the server now holds (qcontact_id → Proton UID):
+    /// confirmed by the re-list or adopted on UID conflict. The shim
+    /// merges the server row into that local contact instead of adding a
+    /// second copy.
+    pub confirmed_creates: std::collections::HashMap<String, String>,
 }
 
 /// Pacing between upload requests (WebClients `API_SAFE_INTERVAL`:
@@ -972,6 +987,7 @@ impl SyncEngine {
                 trace: trace.join("|"),
                 pending_creates: std::collections::HashMap::new(),
                 deferred_list: Vec::new(),
+                confirmed_creates: std::collections::HashMap::new(),
             });
         }
         let client = client
@@ -1041,6 +1057,8 @@ impl SyncEngine {
         }
         let mut created = 0u32;
         let mut adopted = 0u32;
+        let mut confirmed: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         // (qid, stable-uid, per-op code, per-op error) for non-1000 posts.
         let mut conflict_uids: Vec<(String, String, i32, String)> = Vec::new();
         let mut first_chunk = true;
@@ -1133,6 +1151,7 @@ impl SyncEngine {
                 if reconciled.iter().any(|c| &c.UID == uid) {
                     adopted += 1;
                     pending_out.remove(qid);
+                    confirmed.insert(qid.clone(), uid.clone());
                     proton_api::vlog!("upsync_adopted contact {qid} uid-conflict");
                 } else {
                     return Err(proton_api::ProtonError::Api {
@@ -1237,7 +1256,18 @@ impl SyncEngine {
                 _ => None,
             })
             .collect();
-        let ambiguous_local_rows = !plan.apply_server_deletes.is_empty()
+        // An empty local collection while the ID map still lists synced
+        // contacts is far more likely a lost/failed local write than the
+        // user deleting every contact: never turn it into a server wipe.
+        let local_collection_empty = inventory.is_empty() && !known.is_empty();
+        if local_collection_empty && !delete_ids.is_empty() {
+            trace.push(format!(
+                "contact_upsync deletes_held empty_local_collection known={}",
+                known.len()
+            ));
+        }
+        let ambiguous_local_rows = local_collection_empty
+            || !plan.apply_server_deletes.is_empty()
             || inventory.iter().any(|item| item.proton_uid.is_none());
         let mut contacts = contacts;
         let mut deleted = 0u32;
@@ -1276,7 +1306,15 @@ impl SyncEngine {
             let fresh = client
                 .list_all()
                 .map_err(|e| contact_api_err("re-list", e))?;
-            pending_out.clear();
+            // Listed UIDs are confirmed; anything still missing stays
+            // pending so the next POST reuses its UID (adopt, never dup).
+            pending_out.retain(|qid, uid| {
+                let listed = fresh.iter().any(|c| &c.UID == uid);
+                if listed {
+                    confirmed.insert(qid.clone(), uid.clone());
+                }
+                !listed
+            });
             fresh
         } else {
             contacts
@@ -1296,6 +1334,7 @@ impl SyncEngine {
             trace: trace.join("|"),
             pending_creates: pending_out.clone(),
             deferred_list,
+            confirmed_creates: confirmed,
         })
     }
 
@@ -1394,6 +1433,16 @@ impl SyncEngine {
         serde_json::to_string(&*map).unwrap_or_default()
     }
 
+    /// Phone-only creates confirmed server-side this run (`{qcontact_id:
+    /// Proton UID}`; `""` when none).
+    pub fn get_contact_confirmed_json(&self) -> String {
+        let map = lock_or_recover(&self.contact_confirmed);
+        if map.is_empty() {
+            return String::new();
+        }
+        serde_json::to_string(&*map).unwrap_or_default()
+    }
+
     pub fn get_keys_debug(&self) -> Option<String> {
         self.keys_debug.clone()
     }
@@ -1483,58 +1532,89 @@ mod tests {
         mock_get!(r"/core/v4/addresses.*", 200, r#"{"Addresses":[]}"#);
     }
 
-    #[test]
-    fn test_contact_delete_cycle_end_to_end_mock() {
-        // Offline cycle (mockito): known UID missing locally but on server
-        // → batch DELETE → re-list drops it → anchors pruned. No crypto
-        // needed on this path (ID-only ops).
+    fn delete_cycle(
+        inventory: Vec<crate::contact_plan::ContactItem>,
+        known: &[&str],
+        expect_deletes: usize,
+    ) -> SyncEngine {
+        // Offline cycle (mockito): server holds u1 (c1) and u2 (c2). No
+        // crypto needed on this path (ID-only ops).
         let mut server = mockito::Server::new();
         let mut guards = Vec::new();
         mock_key_mocks(&mut server, &mut guards);
         // NOTE: no `$` anchor — mockito matches the regex against
         // path+query, and the list call carries ?Page=&PageSize=.
-        // Created BEFORE the /c1 mock so the single-contact route (also
-        // matching this pattern) wins by reverse-creation precedence.
+        // Created BEFORE the /cN mocks so the single-contact routes (also
+        // matching this pattern) win by reverse-creation precedence.
         guards.push(
             server
                 .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
                 .with_status(200)
                 .with_header("content-type", "application/json")
                 .with_body(
-                    r#"{"Contacts":[{"ID":"c1","Name":"Gone","UID":"u1","ModifyTime":100}],"Total":1}"#,
+                    r#"{"Contacts":[{"ID":"c1","Name":"Gone","UID":"u1","ModifyTime":100},{"ID":"c2","Name":"Kept","UID":"u2","ModifyTime":100}],"Total":2}"#,
                 )
                 .create(),
         );
-        guards.push(
-            server
-                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
-                .with_status(200)
-                .with_header("content-type", "application/json")
-                .with_body(r#"{"Contact":{"ID":"c1","Name":"Gone","UID":"u1","ModifyTime":100}}"#)
-                .create(),
-        );
+        for (id, name, uid) in [("c1", "Gone", "u1"), ("c2", "Kept", "u2")] {
+            guards.push(
+                server
+                    .mock("GET", mockito::Matcher::Regex(format!(r"/contacts/v4/{id}")))
+                    .with_status(200)
+                    .with_header("content-type", "application/json")
+                    .with_body(format!(
+                        r#"{{"Contact":{{"ID":"{id}","Name":"{name}","UID":"{uid}","ModifyTime":100}}}}"#
+                    ))
+                    .create(),
+            );
+        }
         let delete = server
             .mock(
                 "PUT",
                 mockito::Matcher::Regex(r"/contacts/v4/delete".into()),
             )
             .match_body(mockito::Matcher::JsonString(r#"{"IDs":["c1"]}"#.into()))
+            .expect(expect_deletes)
             .with_status(200)
             .with_body("{}")
             .create();
 
         let mut c = cycle_cfg(server.url());
-        c.contact_known_uids = Some(["u1".to_string()].into_iter().collect());
-        c.contact_inventory = Some(Vec::new());
+        c.contact_known_uids = Some(known.iter().map(|u| u.to_string()).collect());
+        c.contact_inventory = Some(inventory);
 
         let mut engine = SyncEngine::new(c.clone());
         engine.start_sync(c);
         assert_eq!(engine.status().state, "complete");
         delete.assert();
-        // Re-listed download lacks c1; anchors pruned (gone everywhere).
-        assert_eq!(engine.get_contacts_json(), "[]");
-        assert_eq!(engine.get_contact_anchors_json(), String::new());
-        let _held = guards;
+        drop(guards);
+        engine
+    }
+
+    #[test]
+    fn test_contact_delete_cycle_end_to_end_mock() {
+        // Known UID missing locally but on server → batch DELETE → the
+        // download drops it; the surviving local row is untouched.
+        let kept = crate::contact_plan::ContactItem {
+            qcontact_id: "q2".into(),
+            proton_uid: Some("u2".into()),
+            last_synced_mtime: Some(100),
+            ..Default::default()
+        };
+        let engine = delete_cycle(vec![kept], &["u1", "u2"], 1);
+        let json = engine.get_contacts_json();
+        assert!(!json.contains("\"uid\":\"u1\""), "{json}");
+        assert!(json.contains("\"uid\":\"u2\""), "{json}");
+    }
+
+    #[test]
+    fn test_contact_empty_local_collection_never_wipes_server_mock() {
+        // An empty local collection with a populated ID map is a lost
+        // local write, not "user deleted everything": deletes are held.
+        let engine = delete_cycle(Vec::new(), &["u1", "u2"], 0);
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(dbg.contains("deletes_held empty_local_collection"), "{dbg}");
+        assert!(engine.get_contacts_json().contains("\"uid\":\"u1\""));
     }
 
     /// Fresh unlocked test user key, armored TSK (passwordless).
@@ -1864,9 +1944,8 @@ mod tests {
     fn test_contact_half_fed_inventory_drops_known_mock() {
         // 2026-09-09 wipe, second half of the fix: inventory=None (absent
         // or unparsable — e.g. the old `missing field photos` contract
-        // drift) + known=Some must NEVER plan deletes. Genuine "user
-        // deleted every local contact" arrives as Some([]) and still fires
-        // (covered by the pure-delete cycle test).
+        // drift) + known=Some must NEVER plan deletes. Some([]) with a
+        // populated map is held too (see the empty-collection test).
         let mut server = mockito::Server::new();
         let mut guards = Vec::new();
         mock_key_mocks(&mut server, &mut guards);
@@ -2646,6 +2725,7 @@ mod tests {
         .expect("retry completes");
         post2.assert(); // same UID re-POSTed, not a fresh one
         assert!(pending2.is_empty(), "re-list confirms: nothing pending");
+        assert_eq!(outcome.confirmed_creates.get("q1"), Some(&uid));
         assert_eq!(outcome.anchors.get(&uid), Some(&101));
     }
 

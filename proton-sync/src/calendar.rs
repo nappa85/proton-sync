@@ -83,6 +83,11 @@ pub struct CalendarSyncEngine {
     // retry idempotency. Read by the shim via `pending_json` on EVERY
     // outcome (complete clears it, error keeps it).
     last_pending: Arc<Mutex<HashMap<String, String>>>,
+    // Phone-only creates the server now holds (mKCal UID → wire event UID):
+    // confirmed by the re-list or adopted on UID conflict. The shim drops
+    // the local phone copy for these (the server row replaces it) and keeps
+    // them as retry UIDs until its local write succeeds.
+    last_confirmed: Arc<Mutex<HashMap<String, String>>>,
     last_snapshot: Arc<Mutex<Option<crate::calendar_cache::CalendarSnapshot>>>,
 }
 
@@ -113,6 +118,7 @@ impl CalendarSyncEngine {
             last_conflicts: Arc::new(Mutex::new(Vec::new())),
             last_anchors: Arc::new(Mutex::new(HashMap::new())),
             last_pending: Arc::new(Mutex::new(HashMap::new())),
+            last_confirmed: Arc::new(Mutex::new(HashMap::new())),
             last_snapshot: Arc::new(Mutex::new(None)),
         }
     }
@@ -162,6 +168,16 @@ impl CalendarSyncEngine {
         serde_json::to_string(&*map).unwrap_or_default()
     }
 
+    /// Phone-only creates confirmed server-side this run (`{mKCal UID:
+    /// wire event UID}`; `""` when none).
+    pub fn confirmed_json(&self) -> String {
+        let map = lock_or_recover(&self.last_confirmed);
+        if map.is_empty() {
+            return String::new();
+        }
+        serde_json::to_string(&*map).unwrap_or_default()
+    }
+
     pub fn snapshot_json(&self) -> String {
         lock_or_recover(&self.last_snapshot)
             .as_ref()
@@ -190,6 +206,7 @@ impl CalendarSyncEngine {
         *lock_or_recover(&self.config) = config.clone();
         *lock_or_recover(&self.events_json) = None;
         *lock_or_recover(&self.last_snapshot) = None;
+        lock_or_recover(&self.last_confirmed).clear();
         self.set_status(SyncStatus {
             state: "syncing".into(),
             progress: 0.0,
@@ -939,6 +956,8 @@ impl CalendarSyncEngine {
                                     // fresh creates: re-list below.
                                     relist.insert(cal.ID.clone());
                                     lock_or_recover(&self.last_pending).remove(mkcal_uid);
+                                    lock_or_recover(&self.last_confirmed)
+                                        .insert(mkcal_uid.clone(), stable_uid.clone());
                                     self.set_debug(format!(
                                         "upsync_adopted cal={} uid-conflict",
                                         &cal.ID[..8.min(cal.ID.len())]
@@ -1161,13 +1180,19 @@ impl CalendarSyncEngine {
             .iter()
             .flat_map(|(cal, evs)| evs.iter().map(|e| (cal.ID.as_str(), e.UID.as_str())))
             .collect();
+        let mut newly_confirmed = Vec::new();
         lock_or_recover(&self.last_pending).retain(|qid, uid| {
-            !inventory
+            let done = inventory
                 .iter()
                 .find(|item| &item.mkcal_uid == qid)
                 .and_then(|item| item.calendar_id.as_deref())
-                .is_some_and(|calendar| confirmed.contains(&(calendar, uid.as_str())))
+                .is_some_and(|calendar| confirmed.contains(&(calendar, uid.as_str())));
+            if done {
+                newly_confirmed.push((qid.clone(), uid.clone()));
+            }
+            !done
         });
+        lock_or_recover(&self.last_confirmed).extend(newly_confirmed);
         Ok(())
     }
 
@@ -3124,6 +3149,7 @@ mod tests {
             .run_upload_phase(&config, &client, &mut keys, "uid", &mut fetched)
             .expect_err("re-list must fail");
         assert!(format!("{err}").contains("re-list"), "{err}");
+        assert_eq!(engine.confirmed_json(), String::new(), "unconfirmed POST");
         let pending: std::collections::HashMap<String, String> =
             serde_json::from_str(&engine.pending_json()).expect("pending parses");
         assert_eq!(pending.len(), 1);
@@ -3168,6 +3194,9 @@ mod tests {
             .expect("retry completes");
         post2.assert(); // same UID re-POSTed, not a fresh one
         assert_eq!(engine2.pending_json(), String::new(), "re-list drains");
+        let confirmed: std::collections::HashMap<String, String> =
+            serde_json::from_str(&engine2.confirmed_json()).expect("confirmed parses");
+        assert_eq!(confirmed.get("n1"), Some(&uid), "local copy is superseded");
         let _held = guards2;
     }
 
@@ -3225,6 +3254,9 @@ mod tests {
             .run_upload_phase(&config, &client, &mut keys, "uid", &mut fetched)
             .expect("conflict adopts");
         assert!(engine.pending_json().is_empty());
+        let confirmed: std::collections::HashMap<String, String> =
+            serde_json::from_str(&engine.confirmed_json()).expect("confirmed parses");
+        assert_eq!(confirmed.get("n1").map(String::as_str), Some("u-adopt-1"));
         let _held = guards;
     }
 

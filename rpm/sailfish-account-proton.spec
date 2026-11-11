@@ -1,6 +1,6 @@
 Name:           sailfish-account-proton
 Summary:        Proton account provider for SailfishOS
-Version:        0.1.2
+Version:        0.2.0
 Release:        1
 License:        GPL-3.0-or-later
 URL:            https://github.com/nappa85/proton-bridge
@@ -78,6 +78,8 @@ install -m 0644 translations/*.qm \
 # %{_datadir}/icons/hicolor/*/apps/proton.png
 
 %changelog
+* Wed Nov 11 2026 Marco Napetti <marco.napetti@proton.me> - 0.2.0-1
+- Move sync logic from the C++ shims to Rust; incremental local writes instead of delete-and-recreate
 * Sat Oct 1 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.3-1
 - Bulk contacts fetch, per-calendar event id
 * Sat Sep 30 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.2-1
